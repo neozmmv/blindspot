@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 
+	"strings"
+
 	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
@@ -44,12 +46,23 @@ var ConnectCmd = &cobra.Command{
 		fmt.Println("Public addr:", publicAddr)
 
 		// register with the rendezvous server and wait for the peer
-		peerAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		peerPublicAddrStr, peerLocalAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Println("Error registering:", err)
 			return
 		}
+		// peerAddrStr
 
+		myPublicAddr := strings.Split(publicAddr, ":")[0]
+		peerPublicAddr := strings.Split(peerPublicAddrStr, ":")[0]
+
+		var peerAddrStr string
+
+		if myPublicAddr == peerPublicAddr {
+			peerAddrStr = peerLocalAddrStr
+		} else {
+			peerAddrStr = peerPublicAddrStr
+		}
 		fmt.Println("Peer addr:", peerAddrStr)
 
 		// gets peer address

@@ -48,10 +48,21 @@ var ChatCmd = &cobra.Command{
 		fmt.Println("Public addr:", publicAddr)
 
 		// register with the rendezvous server and wait for the peer
-		peerAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		peerPublicAddrStr, peerLocalAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Println("Error registering:", err)
 			return
+		}
+
+		myPublicAddr := strings.Split(publicAddr, ":")[0]
+		peerPublicAddr := strings.Split(peerPublicAddrStr, ":")[0]
+
+		var peerAddrStr string
+
+		if myPublicAddr == peerPublicAddr {
+			peerAddrStr = peerLocalAddrStr
+		} else {
+			peerAddrStr = peerPublicAddrStr
 		}
 
 		fmt.Println("Peer addr:", peerAddrStr)
@@ -118,7 +129,9 @@ var ChatCmd = &cobra.Command{
 		// handle shutdown gracefully
 		// sends 0x05 (DEAD) to peer before closing connection
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt) // testing for windows ctrl + C, should work on linux too
+		signal.Notify(sigCh, os.Interrupt) // works on linux
+		// windows is dumb asf and doesnt work
+		// there is nothing we can do about it, as far as i know :(
 		go func() {
 			<-sigCh
 			fmt.Println("\nDisconnecting from peer...")

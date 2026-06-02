@@ -90,7 +90,7 @@ func GetLocalAddr(remotePort int) string {
 
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok {
-			if !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			if ipnet.IP.IsPrivate() && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
 				return fmt.Sprintf("%s:%d", ipnet.IP.String(), remotePort)
 			}
 		}

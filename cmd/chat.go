@@ -97,7 +97,14 @@ var ChatCmd = &cobra.Command{
 		// send keepalive every 10s
 		go network.KeepAlive(conn, peerAddr)
 
-		go network.WatchConnection(conn)
+		// go network.WatchConnection(conn)
+
+		go func() {
+			if err := network.WatchConnection(conn); err != nil {
+				fmt.Println("Connection lost, exiting chat...")
+				os.Exit(0)
+			}
+		}()
 
 		// reads from stdin
 		scanner := bufio.NewScanner(os.Stdin)
@@ -113,6 +120,11 @@ var ChatCmd = &cobra.Command{
 
 			if err := network.SendToPeer(conn, peerAddr, sharedKey, []byte(text)); err != nil {
 				fmt.Println("Error sending to peer:", err)
+			}
+
+			if scanner.Err() != nil {
+				fmt.Println("Error reading from stdin:", scanner.Err())
+				break
 			}
 		}
 

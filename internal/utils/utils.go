@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/neozmmv/blindspot/internal/crypto"
 )
 
 type Identity struct {
@@ -71,4 +73,18 @@ func ReadIdentity() (privateKey, publicKey []byte, err error) {
 		return nil, nil, fmt.Errorf("error decoding public key: %w", err)
 	}
 	return privateKey, publicKey, nil
+}
+
+func InitIdentity() (*crypto.KeyPair, error) {
+	if IdentityExists() {
+		return nil, fmt.Errorf("identity already exists")
+	}
+	keyPair, err := crypto.GenerateKeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("Error generating key pair: %v\n", err)
+	}
+	if err := WriteIdentity(keyPair.PrivateKey, keyPair.PublicKey); err != nil {
+		return nil, fmt.Errorf("Error writing identity: %v\n", err)
+	}
+	return keyPair, nil
 }

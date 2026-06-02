@@ -1,5 +1,6 @@
 package network
 
+/*
 import (
 	"bufio"
 	"fmt"
@@ -81,3 +82,4 @@ func watchConnection() {
 		}
 	}
 }
+*/

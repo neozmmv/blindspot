@@ -14,6 +14,7 @@ func init() {
 	rootCmd.AddCommand(cmd.CreateCmd)
 	rootCmd.AddCommand(cmd.ConnectCmd)
 	rootCmd.AddCommand(cmd.ChatCmd)
+	rootCmd.AddCommand(cmd.VersionCmd)
 }
 
 func main() {

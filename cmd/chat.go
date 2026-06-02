@@ -61,6 +61,7 @@ var ChatCmd = &cobra.Command{
 
 		if myPublicAddr == peerPublicAddr {
 			peerAddrStr = peerLocalAddrStr
+			fmt.Println("You are in the same network.")
 		} else {
 			peerAddrStr = peerPublicAddrStr
 		}

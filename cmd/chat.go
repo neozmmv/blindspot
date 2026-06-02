@@ -1,0 +1,128 @@
+package cmd
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+
+	"github.com/neozmmv/blindspot/internal/crypto"
+	"github.com/neozmmv/blindspot/internal/network"
+	"github.com/neozmmv/blindspot/internal/session"
+	"github.com/neozmmv/blindspot/internal/utils"
+	"github.com/spf13/cobra"
+)
+
+var ChatCmd = &cobra.Command{
+	Use:   "chat",
+	Short: "Chat with a peer in the blindspot network",
+	Run: func(cmd *cobra.Command, args []string) {
+		hostname, _ := cmd.Flags().GetString("hostname")
+		sessionId, _ := cmd.Flags().GetString("session")
+		password, _ := cmd.Flags().GetString("password")
+		create, _ := cmd.Flags().GetBool("create")
+
+		// loads identity (private key + public key)
+		privateKey, publicKey, err := utils.ReadIdentity()
+		if err != nil {
+			// if identity doesn't exist, create one and save it
+			keyPair, err := utils.InitIdentity()
+			if err != nil {
+				fmt.Println("Error initializing identity:", err)
+				return
+			}
+			privateKey = keyPair.PrivateKey
+			publicKey = keyPair.PublicKey
+		}
+
+		// open UDP connection and get public address
+		conn, publicAddr, err := network.OpenUDPConn()
+		if err != nil {
+			fmt.Println("Error opening UDP connection:", err)
+			return
+		}
+		defer conn.Close()
+
+		fmt.Println("Public addr:", publicAddr)
+
+		// register with the rendezvous server and wait for the peer
+		peerAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		if err != nil {
+			fmt.Println("Error registering:", err)
+			return
+		}
+
+		fmt.Println("Peer addr:", peerAddrStr)
+
+		// gets peer address
+		peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
+		if err != nil {
+			fmt.Println("Error resolving peer address:", err)
+			return
+		}
+
+		// hole punching + handshake
+		go network.PunchHole(conn, peerAddr, publicKey)
+		peerPublicKey, err := network.WaitForHello(conn)
+		if err != nil {
+			fmt.Println("Error waiting for hello:", err)
+			return
+		}
+
+		// derive shared key
+		sharedKey, err := crypto.DeriveSharedKey(privateKey, peerPublicKey)
+		if err != nil {
+			fmt.Println("Error deriving shared key:", err)
+			return
+		}
+
+		network.UpdateLastSeen()
+
+		fmt.Println("Connected! Shared key:", sharedKey[:8], "...")
+
+		// keeps reading from peer
+		go func() {
+			for {
+				plaintext, _, err := network.ReadFromPeer(conn, sharedKey)
+				if err != nil {
+					fmt.Println("Error reading from peer:", err)
+					return
+				}
+				fmt.Println("Peer:", string(plaintext))
+				network.UpdateLastSeen()
+			}
+		}()
+
+		// send keepalive every 10s
+		go network.KeepAlive(conn, peerAddr)
+
+		go network.WatchConnection(conn)
+
+		// reads from stdin
+		scanner := bufio.NewScanner(os.Stdin)
+		for {
+			fmt.Print("> ")
+			if !scanner.Scan() {
+				break
+			}
+			text := scanner.Text()
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+
+			if err := network.SendToPeer(conn, peerAddr, sharedKey, []byte(text)); err != nil {
+				fmt.Println("Error sending to peer:", err)
+			}
+		}
+
+	},
+}
+
+func init() {
+	ChatCmd.Flags().StringP("hostname", "H", "", "Rendezvous server hostname")
+	ChatCmd.Flags().StringP("session", "s", "", "Session ID")
+	ChatCmd.Flags().StringP("password", "p", "", "Session password")
+	ChatCmd.Flags().BoolP("create", "c", false, "Create session with password")
+	ChatCmd.MarkFlagRequired("session")
+}

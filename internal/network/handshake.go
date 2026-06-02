@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/pion/stun"
 )
@@ -46,9 +47,28 @@ func OpenUDPConn() (*net.UDPConn, string, error) {
 // BLINDSPOT PROTOCOL
 // HELLO <public key> - sent by initiator to responder to start handshake
 // HELLO <public key> - sent by responder to initiator in response to HELLO
-func PunchHole(conn *net.UDPConn, peerAddr *net.UDPAddr) {
-	// public key will be added later, but it should be exchanged here
+// HELLO PACKET is 0x01 followed by 32 bytes of public key (as defined in protocol.go)
+func PunchHole(conn *net.UDPConn, peerAddr *net.UDPAddr, publicKey []byte) {
 	for i := 0; i < 50; i++ {
-		conn.WriteToUDP([]byte("HELLO"), peerAddr)
+		conn.WriteToUDP(append([]byte{PacketHello}, publicKey...), peerAddr)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func WaitForHello(conn *net.UDPConn) ([]byte, error) {
+	// waits for HELLO and closes the connected channel when it receives a HELLO
+	buf := make([]byte, 1024)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return nil, fmt.Errorf("error reading from peer: %w", err)
+		}
+		if n > 0 && buf[0] == PacketHello {
+			if n != 33 { // 1 byte for PacketHello + 32 bytes for public key
+				fmt.Println("Invalid HELLO packet received")
+				continue
+			}
+			return buf[1:n], nil // return the public key
+		}
 	}
 }

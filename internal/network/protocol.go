@@ -1,5 +1,7 @@
 package network
 
+// CONSTANTS for BLINDSPOT PROTOCOL
+// THE BYTES REPRESENT A PACKET TYPE
 const (
 	PacketHello byte = 0x01
 	PacketPing  byte = 0x02

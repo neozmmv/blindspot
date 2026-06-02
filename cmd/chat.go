@@ -88,6 +88,10 @@ var ChatCmd = &cobra.Command{
 			for {
 				plaintext, _, err := network.ReadFromPeer(conn, sharedKey)
 				if err != nil {
+					if strings.Contains(err.Error(), "peer is dead") {
+						fmt.Println("Peer has disconnected.")
+						os.Exit(0)
+					}
 					fmt.Println("Error reading from peer:", err)
 					return
 				}

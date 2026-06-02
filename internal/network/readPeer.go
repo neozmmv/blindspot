@@ -32,7 +32,6 @@ func ReadFromPeer(conn *net.UDPConn, sharedKey []byte) ([]byte, *net.UDPAddr, er
 
 		if buf[0] == PacketDead {
 			// peer is dead, close connection
-			conn.Close()
 			return nil, nil, fmt.Errorf("peer is dead")
 		}
 

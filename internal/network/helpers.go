@@ -3,13 +3,16 @@ package network
 import (
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
-var lastSeen time.Time
+var (
+	lastSeen time.Time
+	mu       sync.Mutex
+)
 
-// goroutine to keep the connection alive
-// sends 0x1 byte every 10s to the peer
+// sends 0x02 every 10 seconds to keep the connection alive
 func KeepAlive(conn *net.UDPConn, peerAddr *net.UDPAddr) {
 	for {
 		time.Sleep(10 * time.Second)
@@ -20,7 +23,10 @@ func KeepAlive(conn *net.UDPConn, peerAddr *net.UDPAddr) {
 func WatchConnection(conn *net.UDPConn) {
 	for {
 		time.Sleep(30 * time.Second)
-		if time.Since(lastSeen) > 30*time.Second {
+		mu.Lock()
+		since := time.Since(lastSeen)
+		mu.Unlock()
+		if since > 30*time.Second {
 			fmt.Println("Connection lost...")
 			conn.Close()
 			return
@@ -29,5 +35,7 @@ func WatchConnection(conn *net.UDPConn) {
 }
 
 func UpdateLastSeen() {
+	mu.Lock()
 	lastSeen = time.Now()
+	mu.Unlock()
 }

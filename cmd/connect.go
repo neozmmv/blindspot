@@ -74,6 +74,8 @@ var ConnectCmd = &cobra.Command{
 			return
 		}
 
+		network.UpdateLastSeen()
+
 		fmt.Println("Connected! Shared key:", sharedKey[:8], "...")
 	},
 }

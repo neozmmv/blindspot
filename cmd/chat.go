@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
@@ -119,7 +118,7 @@ var ChatCmd = &cobra.Command{
 		// handle shutdown gracefully
 		// sends 0x05 (DEAD) to peer before closing connection
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(sigCh, os.Interrupt) // testing for windows ctrl + C, should work on linux too
 		go func() {
 			<-sigCh
 			fmt.Println("\nDisconnecting from peer...")

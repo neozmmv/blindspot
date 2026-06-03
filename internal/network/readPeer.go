@@ -19,7 +19,8 @@ func ReadFromPeer(conn *net.UDPConn, sharedKey []byte) ([]byte, *net.UDPAddr, er
 		// BLINDSPOT PROTOCOL KEYWORDS
 
 		if buf[0] == PacketHello {
-			// HELLO should be responded in the handshake.go file, so we just ignore it here
+			// receiving HELLO means another peer is trying to connect
+			// respond with HELLO + pubkey to complete handshake
 			continue
 		}
 

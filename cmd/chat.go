@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"strings"
 
-	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -27,7 +26,6 @@ var ChatCmd = &cobra.Command{
 		// loads identity (private key + public key)
 		privateKey, publicKey, err := utils.ReadIdentity()
 		if err != nil {
-			// if identity doesn't exist, create one and save it
 			keyPair, err := utils.InitIdentity()
 			if err != nil {
 				fmt.Println("Error initializing identity:", err)
@@ -47,78 +45,63 @@ var ChatCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		// register with the rendezvous server and wait for the peer
-		peerPublicAddrStr, peerLocalAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		// register with the rendezvous server
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
-			fmt.Println("Error registering:", err)
+			fmt.Printf("Error registering: %v\n", err)
 			return
 		}
 
-		myPublicAddr := strings.Split(publicAddr, ":")[0]
-		peerPublicAddr := strings.Split(peerPublicAddrStr, ":")[0]
+		myPublicIP := strings.Split(publicAddr, ":")[0]
+		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
 
-		var peerAddrStr string
-
-		if myPublicAddr == peerPublicAddr {
-			peerAddrStr = peerLocalAddrStr
-			fmt.Println("You are in the same network.")
-		} else {
-			peerAddrStr = peerPublicAddrStr
+		// hole punching with all peers
+		for _, peer := range peers {
+			peerAddrStr := peer.Public
+			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
+				fmt.Printf("Same network detected, connecting locally to %s\n", peer.Public)
+				peerAddrStr = peer.Local
+			}
+			peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
+			if err != nil {
+				fmt.Printf("Error resolving peer address: %v\n", err)
+				continue
+			}
+			fmt.Printf("Peer addr: %s\n", peerAddrStr)
+			go peerConn.PunchHole(peerAddr)
 		}
 
-		fmt.Println("Peer addr:", peerAddrStr)
-
-		// gets peer address
-		peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
-		if err != nil {
-			fmt.Println("Error resolving peer address:", err)
-			return
-		}
-
-		// hole punching + handshake
-		go network.PunchHole(conn, peerAddr, publicKey)
-		peerPublicKey, err := network.WaitForHello(conn)
-		if err != nil {
-			fmt.Println("Error waiting for hello:", err)
-			return
-		}
-
-		// derive shared key
-		sharedKey, err := crypto.DeriveSharedKey(privateKey, peerPublicKey)
-		if err != nil {
-			fmt.Println("Error deriving shared key:", err)
-			return
-		}
-
-		network.UpdateLastSeen()
-
-		fmt.Println("Connected! Shared key:", sharedKey[:8], "...")
-
-		// keeps reading from peer
+		// single read loop — handles handshake and messages
 		go func() {
 			for {
-				plaintext, _, err := network.ReadFromPeer(conn, sharedKey)
+				plaintext, addr, err := peerConn.Read()
 				if err != nil {
-					// suppress expected errors on client disconnect
 					if strings.Contains(err.Error(), "peer is dead") {
-						fmt.Println("Peer has disconnected.")
-						os.Exit(0)
+						fmt.Printf("\n[%s] disconnected.\n", addr)
+						continue
 					}
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
 					}
-					fmt.Println("Error reading from peer:", err)
-					return
+					continue
 				}
-				fmt.Println("Peer:", string(plaintext))
-				network.UpdateLastSeen()
+				// only print after connected
+				select {
+				case <-peerConn.Connected:
+					fmt.Printf("\n[%s]: %s\n> ", addr, string(plaintext))
+					network.UpdateLastSeen()
+				default:
+					// not yet connected, discard
+				}
 			}
 		}()
 
-		// send keepalive every 10s
-		go network.KeepAlive(conn, peerAddr)
+		// wait for first peer to connect
+		connectedAddr := <-peerConn.Connected
+		fmt.Printf("%s connected!\n", connectedAddr)
+		network.UpdateLastSeen()
 
-		// go network.WatchConnection(conn)
+		go network.KeepAlive(conn, connectedAddr)
 
 		go func() {
 			if err := network.WatchConnection(conn); err != nil {
@@ -128,15 +111,12 @@ var ChatCmd = &cobra.Command{
 		}()
 
 		// handle shutdown gracefully
-		// sends 0x05 (DEAD) to peer before closing connection
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt) // works on linux
-		// windows is dumb asf and doesnt work
-		// there is nothing we can do about it, as far as i know :(
+		signal.Notify(sigCh, os.Interrupt)
 		go func() {
 			<-sigCh
-			fmt.Println("\nDisconnecting from peer...")
-			conn.WriteToUDP([]byte{network.PacketDead}, peerAddr)
+			fmt.Println("\nDisconnecting...")
+			conn.WriteToUDP([]byte{network.PacketDead}, connectedAddr)
 			conn.Close()
 			os.Exit(0)
 		}()
@@ -152,9 +132,8 @@ var ChatCmd = &cobra.Command{
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-
-			if err := network.SendToPeer(conn, peerAddr, sharedKey, []byte(text)); err != nil {
-				fmt.Println("Error sending to peer:", err)
+			if err := peerConn.Send(connectedAddr, []byte(text)); err != nil {
+				fmt.Println("Error sending:", err)
 			}
 		}
 		if scanner.Err() != nil {

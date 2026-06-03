@@ -3,10 +3,8 @@ package cmd
 import (
 	"fmt"
 	"net"
-
 	"strings"
 
-	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -25,7 +23,6 @@ var ConnectCmd = &cobra.Command{
 		// loads identity (private key + public key)
 		privateKey, publicKey, err := utils.ReadIdentity()
 		if err != nil {
-			// if identity doesn't exist, create one and save it
 			keyPair, err := utils.InitIdentity()
 			if err != nil {
 				fmt.Println("Error initializing identity:", err)
@@ -45,51 +42,50 @@ var ConnectCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		// register with the rendezvous server and wait for the peer
-		peerPublicAddrStr, peerLocalAddrStr, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		// register with the rendezvous server
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Println("Error registering:", err)
 			return
 		}
-		// peerAddrStr
 
-		myPublicAddr := strings.Split(publicAddr, ":")[0]
-		peerPublicAddr := strings.Split(peerPublicAddrStr, ":")[0]
+		myPublicIP := strings.Split(publicAddr, ":")[0]
 
-		var peerAddrStr string
+		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
 
-		if myPublicAddr == peerPublicAddr {
-			peerAddrStr = peerLocalAddrStr
-		} else {
-			peerAddrStr = peerPublicAddrStr
-		}
-		fmt.Println("Peer addr:", peerAddrStr)
-
-		// gets peer address
-		peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
-		if err != nil {
-			fmt.Println("Error resolving peer address:", err)
-			return
-		}
-
-		// hole punching + handshake
-		go network.PunchHole(conn, peerAddr, publicKey)
-		peerPublicKey, err := network.WaitForHello(conn)
-		if err != nil {
-			fmt.Println("Error waiting for hello:", err)
-			return
+		// hole punching with all peers
+		for _, peer := range peers {
+			peerAddrStr := peer.Public
+			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
+				fmt.Printf("Same network detected, connecting locally to %s\n", peer.Public)
+				peerAddrStr = peer.Local
+			}
+			peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
+			if err != nil {
+				fmt.Printf("Error resolving peer address: %v\n", err)
+				continue
+			}
+			fmt.Printf("Peer addr: %s\n", peerAddrStr)
+			go peerConn.PunchHole(peerAddr)
 		}
 
-		// derive shared key
-		sharedKey, err := crypto.DeriveSharedKey(privateKey, peerPublicKey)
-		if err != nil {
-			fmt.Println("Error deriving shared key:", err)
-			return
-		}
+		// listens for HELLO from peers
 
+		go func() {
+			for {
+				peerConn.Read()
+			}
+		}()
+
+		// wait for first peer to connect
+		connectedAddr := <-peerConn.Connected
+		fmt.Printf("%s connected!\n", connectedAddr)
 		network.UpdateLastSeen()
 
-		fmt.Println("Connected! Shared key:", sharedKey[:8], "...")
+		// just block to keep the connection
+		// this will be the vpn connection
+		// not fully done yet
+		select {}
 	},
 }
 

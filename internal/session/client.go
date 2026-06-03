@@ -10,7 +10,12 @@ import (
 	"strings"
 )
 
-func Register(hostname, sessionId, password, udpAddr string, create bool) (string, string, error) {
+type PeerAddr struct {
+	Public string
+	Local  string
+}
+
+func Register(hostname, sessionId, password, udpAddr string, create bool) ([]PeerAddr, error) {
 	if hostname != "" && hostname[len(hostname)-1] == '/' {
 		hostname = hostname[:len(hostname)-1]
 	}
@@ -21,10 +26,9 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) (strin
 		hostname = "https://" + hostname
 	}
 	if strings.TrimSpace(sessionId) == "" {
-		return "", "", fmt.Errorf("sessionId is required")
+		return nil, fmt.Errorf("sessionId is required")
 	}
 
-	// creates session if create is true and password is provided, otherwise it will just try to join the session (which will fail if the session doesn't exist or password is wrong)
 	if password != "" && create {
 		createBody, _ := json.Marshal(map[string]string{
 			"id":       sessionId,
@@ -32,22 +36,20 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) (strin
 		})
 		res, err := http.Post(fmt.Sprintf("%s/create_session", hostname), "application/json", bytes.NewBuffer(createBody))
 		if err != nil {
-			return "", "", fmt.Errorf("failed to create session: %w", err)
+			return nil, fmt.Errorf("failed to create session: %w", err)
 		}
 		defer res.Body.Close()
 		var createRes map[string]string
 		json.NewDecoder(res.Body).Decode(&createRes)
 		if createRes["error"] != "" {
-			return "", "", fmt.Errorf("failed to create session: %s", createRes["error"])
+			return nil, fmt.Errorf("failed to create session: %s", createRes["error"])
 		}
 	}
-
-	// registers the session and gets the peer's public address
 
 	parts := strings.Split(udpAddr, ":")
 	port, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
-		return "", "", fmt.Errorf("failed to parse UDP address: %w", err)
+		return nil, fmt.Errorf("failed to parse UDP address: %w", err)
 	}
 	localAddr := GetLocalAddr(port)
 
@@ -69,17 +71,31 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) (strin
 
 	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
 	if err != nil {
-		return "", "", fmt.Errorf("failed to register: %w", err)
+		return nil, fmt.Errorf("failed to register: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var respBody map[string]string
+	// server returns {"peers": [{"ip": "...", "local_addr": "..."}]}
+	var respBody struct {
+		Peers []struct {
+			IP        string `json:"ip"`
+			LocalAddr string `json:"local_addr"`
+		} `json:"peers"`
+		Error string `json:"error"`
+	}
 	json.NewDecoder(resp.Body).Decode(&respBody)
-	if respBody["error"] != "" {
-		return "", "", fmt.Errorf("error from server: %s", respBody["error"])
+	if respBody.Error != "" {
+		return nil, fmt.Errorf("error from server: %s", respBody.Error)
 	}
 
-	return respBody["peer"], respBody["local_addr"], nil
+	peers := make([]PeerAddr, len(respBody.Peers))
+	for i, p := range respBody.Peers {
+		peers[i] = PeerAddr{
+			Public: p.IP,
+			Local:  p.LocalAddr,
+		}
+	}
+	return peers, nil
 }
 
 func GetLocalAddr(remotePort int) string {
@@ -87,7 +103,6 @@ func GetLocalAddr(remotePort int) string {
 	if err != nil {
 		return ""
 	}
-
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok {
 			if ipnet.IP.IsPrivate() && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {

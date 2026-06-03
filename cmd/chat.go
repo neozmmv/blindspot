@@ -58,6 +58,8 @@ var ChatCmd = &cobra.Command{
 			conn.Close()
 		}()
 
+		knownPeers := make(map[string]bool)
+
 		for _, peer := range peers {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
@@ -70,10 +72,31 @@ var ChatCmd = &cobra.Command{
 				continue
 			}
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
+			knownPeers[peerAddrStr] = true
 			go peerConn.PunchHole(peerAddr)
 		}
 
 		quit := make(chan struct{})
+
+		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
+		go func() {
+			for peer := range peerStream {
+				peerAddrStr := peer.Public
+				if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
+					peerAddrStr = peer.Local
+				}
+				if knownPeers[peerAddrStr] {
+					continue
+				}
+				knownPeers[peerAddrStr] = true
+				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
+				if err != nil {
+					continue
+				}
+				fmt.Printf("\nNew peer discovered: %s\n> ", peerAddrStr)
+				go peerConn.PunchHole(peerAddr)
+			}
+		}()
 
 		// single read loop
 		go func() {

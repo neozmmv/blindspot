@@ -1,11 +1,14 @@
 package session
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -111,6 +114,73 @@ func GetLocalAddr(remotePort int) string {
 		}
 	}
 	return ""
+}
+
+// StreamPeers opens an SSE connection to the rendezvous server and returns a channel
+// that emits peers as they join the session (including peers already present).
+// The stream closes when quit is closed.
+func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struct{}) <-chan PeerAddr {
+	if hostname != "" && hostname[len(hostname)-1] == '/' {
+		hostname = hostname[:len(hostname)-1]
+	}
+	if strings.TrimSpace(hostname) == "" {
+		hostname = "https://rendezvous.enzogp.dev"
+	}
+	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
+		hostname = "https://" + hostname
+	}
+
+	var endpoint string
+	if password != "" {
+		endpoint = fmt.Sprintf("%s/join_session/%s/stream?password=%s&udp_addr=%s",
+			hostname, sessionId, url.QueryEscape(password), url.QueryEscape(myAddr))
+	} else {
+		endpoint = fmt.Sprintf("%s/session/%s/stream?udp_addr=%s",
+			hostname, sessionId, url.QueryEscape(myAddr))
+	}
+
+	ch := make(chan PeerAddr, 10)
+	go func() {
+		defer close(ch)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-quit
+			cancel()
+		}()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			var peer struct {
+				IP        string `json:"ip"`
+				LocalAddr string `json:"local_addr"`
+			}
+			if err := json.Unmarshal([]byte(data), &peer); err != nil {
+				continue
+			}
+			select {
+			case ch <- PeerAddr{Public: peer.IP, Local: peer.LocalAddr}:
+			case <-quit:
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 func Leave(hostname, sessionId, password, udpAddr string) {

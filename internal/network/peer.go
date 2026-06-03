@@ -61,15 +61,14 @@ func (p *PeerConn) Read() ([]byte, *net.UDPAddr, error) {
 		}
 		switch buf[0] {
 		case PacketHello:
-			// peer wants to connect, add to peer list and respond with HELLO + pubkey
 			peerPublicKey := buf[1:n]
-			fmt.Printf("[DEBUG] received HELLO from %s\n", addr)
-			p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
 			p.mu.Lock()
 			_, alreadyConnected := p.sharedKeys[addr.String()]
 			p.mu.Unlock()
 
 			if !alreadyConnected {
+				fmt.Printf("[DEBUG] received HELLO from %s\n", addr)
+				p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
 				p.AddPeer(addr, peerPublicKey)
 				go p.PunchHole(addr)
 			}
@@ -104,9 +103,15 @@ func (p *PeerConn) PunchHole(peerAddr *net.UDPAddr) {
 	packet := make([]byte, 1+len(p.publicKey))
 	packet[0] = PacketHello
 	copy(packet[1:], p.publicKey)
-	for /* i := 0; i < 200; i++  */ { // 50 -> 200 (maybe infinite loop?)
+	for {
+		p.mu.Lock()
+		_, connected := p.sharedKeys[peerAddr.String()]
+		p.mu.Unlock()
+		if connected {
+			return
+		}
 		p.conn.WriteToUDP(packet, peerAddr)
-		time.Sleep(10 * time.Millisecond) // 100 -> 10 ms, maybe even 5 ms?
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

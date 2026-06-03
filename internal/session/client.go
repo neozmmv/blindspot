@@ -112,3 +112,27 @@ func GetLocalAddr(remotePort int) string {
 	}
 	return ""
 }
+
+func Leave(hostname, sessionId, password, udpAddr string) {
+	if hostname != "" && hostname[len(hostname)-1] == '/' {
+		hostname = hostname[:len(hostname)-1]
+	}
+	if strings.TrimSpace(hostname) == "" {
+		hostname = "https://rendezvous.enzogp.dev"
+	}
+	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
+		hostname = "https://" + hostname
+	}
+	body := map[string]string{"udp_addr": udpAddr}
+	if password != "" {
+		body["password"] = password
+	}
+	bodyJson, _ := json.Marshal(body)
+	var endpoint string
+	if password != "" {
+		endpoint = fmt.Sprintf("%s/join_session/%s/leave", hostname, sessionId)
+	} else {
+		endpoint = fmt.Sprintf("%s/session/%s/leave", hostname, sessionId)
+	}
+	http.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
+}

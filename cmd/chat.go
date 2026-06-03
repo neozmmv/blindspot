@@ -117,6 +117,7 @@ var ChatCmd = &cobra.Command{
 		go func() {
 			<-sigCh
 			fmt.Println("\nDisconnecting...")
+			session.Leave(hostname, sessionId, password, publicAddr)
 			peerConn.Broadcast([]byte{network.PacketDead})
 			conn.Close()
 			os.Exit(0)
@@ -132,6 +133,15 @@ var ChatCmd = &cobra.Command{
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
+
+			if strings.TrimSpace(text) == "/quit" || strings.TrimSpace(text) == "/exit" {
+				fmt.Println("Disconnecting...")
+				session.Leave(hostname, sessionId, password, publicAddr)
+				peerConn.Broadcast([]byte{network.PacketDead})
+				conn.Close()
+				os.Exit(0)
+			}
+
 			peerConn.Broadcast([]byte(text))
 		}
 		if scanner.Err() != nil {

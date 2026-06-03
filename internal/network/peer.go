@@ -64,8 +64,15 @@ func (p *PeerConn) Read() ([]byte, *net.UDPAddr, error) {
 			// peer wants to connect, add to peer list and respond with HELLO + pubkey
 			peerPublicKey := buf[1:n]
 			p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
-			p.AddPeer(addr, peerPublicKey)
+			p.mu.Lock()
+			_, alreadyConnected := p.sharedKeys[addr.String()]
+			p.mu.Unlock()
+
+			if !alreadyConnected {
+				p.AddPeer(addr, peerPublicKey)
+			}
 			continue
+
 		case PacketPing:
 			UpdateLastSeen()
 			p.conn.WriteToUDP([]byte{PacketPong}, addr)

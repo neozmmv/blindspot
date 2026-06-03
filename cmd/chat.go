@@ -23,7 +23,6 @@ var ChatCmd = &cobra.Command{
 		password, _ := cmd.Flags().GetString("password")
 		create, _ := cmd.Flags().GetBool("create")
 
-		// loads identity (private key + public key)
 		privateKey, publicKey, err := utils.ReadIdentity()
 		if err != nil {
 			keyPair, err := utils.InitIdentity()
@@ -35,7 +34,6 @@ var ChatCmd = &cobra.Command{
 			publicKey = keyPair.PublicKey
 		}
 
-		// open UDP connection and get public address
 		conn, publicAddr, err := network.OpenUDPConn()
 		if err != nil {
 			fmt.Println("Error opening UDP connection:", err)
@@ -45,7 +43,6 @@ var ChatCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		// register with the rendezvous server
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
@@ -55,7 +52,7 @@ var ChatCmd = &cobra.Command{
 		myPublicIP := strings.Split(publicAddr, ":")[0]
 		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
 
-		// hole punching with all peers
+		// hole punching with all known peers
 		for _, peer := range peers {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
@@ -71,13 +68,13 @@ var ChatCmd = &cobra.Command{
 			go peerConn.PunchHole(peerAddr)
 		}
 
-		// single read loop — handles handshake and messages
+		// single read loop — handles handshake and incoming messages
 		go func() {
 			for {
 				plaintext, addr, err := peerConn.Read()
 				if err != nil {
 					if strings.Contains(err.Error(), "peer is dead") {
-						fmt.Printf("\n[%s] disconnected.\n", addr)
+						fmt.Printf("\n[%s] disconnected.\n> ", addr)
 						continue
 					}
 					if strings.Contains(err.Error(), "use of closed network connection") {
@@ -85,23 +82,25 @@ var ChatCmd = &cobra.Command{
 					}
 					continue
 				}
-				// only print after connected
-				select {
-				case <-peerConn.Connected:
-					fmt.Printf("\n[%s]: %s\n> ", addr, string(plaintext))
-					network.UpdateLastSeen()
-				default:
-					// not yet connected, discard
-				}
+				fmt.Printf("\n[%s]: %s\n> ", addr, string(plaintext))
+				network.UpdateLastSeen()
 			}
 		}()
 
-		// wait for first peer to connect
-		connectedAddr := <-peerConn.Connected
-		fmt.Printf("%s connected!\n", connectedAddr)
-		network.UpdateLastSeen()
+		// notify when new peers connect
+		go func() {
+			for addr := range peerConn.Connected {
+				fmt.Printf("\n%s joined!\n> ", addr)
+				network.UpdateLastSeen()
+			}
+		}()
 
-		go network.KeepAlive(conn, connectedAddr)
+		// wait for at least one peer
+		fmt.Println("Waiting for peers...")
+		<-peerConn.Connected
+		fmt.Println("Connected! Type to chat.")
+
+		go network.KeepAliveAll(peerConn)
 
 		go func() {
 			if err := network.WatchConnection(conn); err != nil {
@@ -110,18 +109,16 @@ var ChatCmd = &cobra.Command{
 			}
 		}()
 
-		// handle shutdown gracefully
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt)
 		go func() {
 			<-sigCh
 			fmt.Println("\nDisconnecting...")
-			conn.WriteToUDP([]byte{network.PacketDead}, connectedAddr)
+			peerConn.Broadcast([]byte{network.PacketDead})
 			conn.Close()
 			os.Exit(0)
 		}()
 
-		// reads from stdin
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			fmt.Print("> ")
@@ -132,9 +129,7 @@ var ChatCmd = &cobra.Command{
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-			if err := peerConn.Send(connectedAddr, []byte(text)); err != nil {
-				fmt.Println("Error sending:", err)
-			}
+			peerConn.Broadcast([]byte(text))
 		}
 		if scanner.Err() != nil {
 			fmt.Println("Error reading from stdin:", scanner.Err())

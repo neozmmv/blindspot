@@ -14,6 +14,7 @@ type PeerConn struct {
 	privateKey []byte
 	publicKey  []byte
 	sharedKeys map[string][]byte // addr → sharedKey
+	peers      []*net.UDPAddr
 	mu         sync.Mutex
 	Connected  chan *net.UDPAddr // signals when a new peer connects
 }
@@ -35,6 +36,7 @@ func (p *PeerConn) AddPeer(addr *net.UDPAddr, peerPublicKey []byte) error {
 	}
 	p.mu.Lock()
 	p.sharedKeys[addr.String()] = sharedKey
+	p.peers = append(p.peers, addr)
 	p.mu.Unlock()
 	p.Connected <- addr
 	return nil
@@ -96,5 +98,15 @@ func (p *PeerConn) PunchHole(peerAddr *net.UDPAddr) {
 	for i := 0; i < 50; i++ {
 		p.conn.WriteToUDP(packet, peerAddr)
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (p *PeerConn) Broadcast(data []byte) {
+	p.mu.Lock()
+	peers := make([]*net.UDPAddr, len(p.peers))
+	copy(peers, p.peers)
+	p.mu.Unlock()
+	for _, addr := range peers {
+		p.Send(addr, data)
 	}
 }

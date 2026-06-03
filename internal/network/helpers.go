@@ -39,3 +39,16 @@ func UpdateLastSeen() {
 	lastSeen = time.Now()
 	mu.Unlock()
 }
+
+func KeepAliveAll(p *PeerConn) {
+	for {
+		time.Sleep(10 * time.Second)
+		p.mu.Lock()
+		peers := make([]*net.UDPAddr, len(p.peers))
+		copy(peers, p.peers)
+		p.mu.Unlock()
+		for _, addr := range peers {
+			p.conn.WriteToUDP([]byte{PacketPing}, addr)
+		}
+	}
+}

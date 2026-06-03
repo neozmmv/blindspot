@@ -67,7 +67,7 @@ func (p *PeerConn) Read() ([]byte, *net.UDPAddr, error) {
 			p.mu.Unlock()
 
 			if !alreadyConnected {
-				fmt.Printf("[DEBUG] received HELLO from %s\n", addr)
+				// fmt.Printf("[DEBUG] received HELLO from %s\n", addr)
 				p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
 				p.AddPeer(addr, peerPublicKey)
 				go p.PunchHole(addr)

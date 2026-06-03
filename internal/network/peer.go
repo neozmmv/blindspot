@@ -70,6 +70,7 @@ func (p *PeerConn) Read() ([]byte, *net.UDPAddr, error) {
 
 			if !alreadyConnected {
 				p.AddPeer(addr, peerPublicKey)
+				go p.PunchHole(addr)
 			}
 			continue
 
@@ -102,7 +103,7 @@ func (p *PeerConn) PunchHole(peerAddr *net.UDPAddr) {
 	packet := make([]byte, 1+len(p.publicKey))
 	packet[0] = PacketHello
 	copy(packet[1:], p.publicKey)
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 200; i++ { // 50 -> 200 (maybe infinite loop?)
 		p.conn.WriteToUDP(packet, peerAddr)
 		time.Sleep(100 * time.Millisecond)
 	}

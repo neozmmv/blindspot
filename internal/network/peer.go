@@ -117,3 +117,16 @@ func (p *PeerConn) Broadcast(data []byte) {
 		p.Send(addr, data)
 	}
 }
+
+// BroadcastRaw sends raw data without encrypting or adding packet type
+// for sending bytes that are already formatted with packet type, like PacketDead
+// NOT ENCRYPTED!
+func (p *PeerConn) BroadcastRaw(data []byte) {
+	p.mu.Lock()
+	peers := make([]*net.UDPAddr, len(p.peers))
+	copy(peers, p.peers)
+	p.mu.Unlock()
+	for _, addr := range peers {
+		p.conn.WriteToUDP(data, addr)
+	}
+}

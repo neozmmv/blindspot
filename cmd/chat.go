@@ -39,18 +39,24 @@ var ChatCmd = &cobra.Command{
 			fmt.Println("Error opening UDP connection:", err)
 			return
 		}
-		defer conn.Close()
 
 		fmt.Println("Public addr:", publicAddr)
 
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
+			conn.Close()
 			return
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
 		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
+
+		defer func() {
+			session.Leave(hostname, sessionId, password, publicAddr)
+			peerConn.BroadcastRaw([]byte{network.PacketDead})
+			conn.Close()
+		}()
 
 		for _, peer := range peers {
 			peerAddrStr := peer.Public
@@ -66,6 +72,8 @@ var ChatCmd = &cobra.Command{
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
 			go peerConn.PunchHole(peerAddr)
 		}
+
+		quit := make(chan struct{})
 
 		// single read loop
 		go func() {
@@ -86,7 +94,7 @@ var ChatCmd = &cobra.Command{
 			}
 		}()
 
-		// wait for at least one peer, notify as others join
+		// notify as peers join
 		atLeastOne := make(chan struct{}, 1)
 		go func() {
 			for addr := range peerConn.Connected {
@@ -105,24 +113,24 @@ var ChatCmd = &cobra.Command{
 
 		go network.KeepAliveAll(peerConn)
 
+		// watch connection
 		go func() {
 			if err := network.WatchConnection(conn); err != nil {
 				fmt.Println("Connection lost, exiting chat...")
-				os.Exit(0)
+				close(quit)
 			}
 		}()
 
+		// handle Ctrl+C
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt)
 		go func() {
 			<-sigCh
 			fmt.Println("\nDisconnecting...")
-			session.Leave(hostname, sessionId, password, publicAddr)
-			peerConn.Broadcast([]byte{network.PacketDead})
-			conn.Close()
-			os.Exit(0)
+			close(quit)
 		}()
 
+		// reads from stdin
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			fmt.Print("> ")
@@ -133,17 +141,24 @@ var ChatCmd = &cobra.Command{
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-
 			if strings.TrimSpace(text) == "/quit" || strings.TrimSpace(text) == "/exit" {
 				fmt.Println("Disconnecting...")
-				session.Leave(hostname, sessionId, password, publicAddr)
-				peerConn.Broadcast([]byte{network.PacketDead})
-				conn.Close()
-				os.Exit(0)
+				break
 			}
-
-			peerConn.Broadcast([]byte(text))
+			select {
+			case <-quit:
+				return
+			default:
+				peerConn.Broadcast([]byte(text))
+			}
 		}
+
+		// wait for quit signal if not already received
+		select {
+		case <-quit:
+		default:
+		}
+
 		if scanner.Err() != nil {
 			fmt.Println("Error reading from stdin:", scanner.Err())
 		}

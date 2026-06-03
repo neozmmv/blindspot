@@ -52,7 +52,6 @@ var ChatCmd = &cobra.Command{
 		myPublicIP := strings.Split(publicAddr, ":")[0]
 		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
 
-		// hole punching with all known peers
 		for _, peer := range peers {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
@@ -68,7 +67,7 @@ var ChatCmd = &cobra.Command{
 			go peerConn.PunchHole(peerAddr)
 		}
 
-		// single read loop — handles handshake and incoming messages
+		// single read loop
 		go func() {
 			for {
 				plaintext, addr, err := peerConn.Read()
@@ -87,17 +86,21 @@ var ChatCmd = &cobra.Command{
 			}
 		}()
 
-		// notify when new peers connect
+		// wait for at least one peer, notify as others join
+		atLeastOne := make(chan struct{}, 1)
 		go func() {
 			for addr := range peerConn.Connected {
 				fmt.Printf("\n%s joined!\n> ", addr)
 				network.UpdateLastSeen()
+				select {
+				case atLeastOne <- struct{}{}:
+				default:
+				}
 			}
 		}()
 
-		// wait for at least one peer
 		fmt.Println("Waiting for peers...")
-		<-peerConn.Connected
+		<-atLeastOne
 		fmt.Println("Connected! Type to chat.")
 
 		go network.KeepAliveAll(peerConn)

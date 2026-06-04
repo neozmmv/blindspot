@@ -130,6 +130,60 @@ sudo blindspot connect -s my-network -p mypassword -n
 
 ---
 
+### List peers — `list`
+
+Prints all peers currently connected to the active session, showing their virtual IP and public address.
+
+```bash
+blindspot list
+```
+
+```
+VIRTUAL IP          PUBLIC ADDRESS
+10.142.31.7         203.0.113.45:51820
+10.88.201.14        198.51.100.12:51820
+```
+
+Requires an active session. Returns `No active session.` if no daemon is running.
+
+---
+
+### Your virtual IP — `ip`
+
+Prints your own virtual IP address without needing an active connection. Useful for sharing your address with peers before or during a session.
+
+```bash
+blindspot ip
+# 10.x.x.x
+```
+
+---
+
+### File transfer — `send` / `receive`
+
+Send files directly to a peer over the VPN tunnel — no credentials, no server, no setup. Traffic is encrypted end-to-end by the VPN layer.
+
+```bash
+# receiver runs first
+blindspot receive
+# Waiting for file on 10.x.x.x:28125...
+
+# sender
+blindspot send 10.x.x.x path/to/file.zip
+# Sending file.zip (4823041 bytes) to 10.x.x.x...
+# Sent 4823041 bytes.
+```
+
+Files are saved to `~/Downloads` by default. Use `--here` to save to the current directory instead:
+
+```bash
+blindspot receive --here
+```
+
+If the peer is not listening, the sender waits 5 seconds and prints a clear message rather than hanging.
+
+---
+
 ### Chat mode — `chat`
 
 Encrypted P2P chat directly between peers. No VPN adapter required.
@@ -197,5 +251,5 @@ The signaling server only sees UDP addresses during the handshake — it never t
 - [ ] macOS TUN support
 - [ ] Forward secrecy via ephemeral keypairs
 - [ ] Reliable delivery (ACK + retransmission)
-- [ ] File transfer
+- [x] File transfer (`send` / `receive` over the VPN tunnel)
 - [ ] System tray UI

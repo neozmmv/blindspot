@@ -161,6 +161,10 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
+			if scanner.Err() != nil {
+				fmt.Printf("Error while scanning: %s\n", scanner.Err().Error())
+				return
+			}
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data:") {
 				continue

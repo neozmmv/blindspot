@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -34,9 +35,9 @@ var SendCmd = &cobra.Command{
 			return
 		}
 
-		conn, err := net.Dial("tcp", peerIP+transferPort)
+		conn, err := net.DialTimeout("tcp", peerIP+transferPort, 5*time.Second)
 		if err != nil {
-			fmt.Printf("Could not connect to %s: %v\n", peerIP, err)
+			fmt.Printf("Peer %s is not receiving. Ask them to run 'blindspot receive'.\n", peerIP)
 			return
 		}
 		defer conn.Close()

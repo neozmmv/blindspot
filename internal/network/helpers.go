@@ -27,8 +27,6 @@ func WatchConnection(conn *net.UDPConn) error {
 		since := time.Since(lastSeen)
 		mu.Unlock()
 		if since > 30*time.Second {
-			fmt.Println("Connection lost...")
-			conn.Close()
 			return fmt.Errorf("connection lost")
 		}
 	}

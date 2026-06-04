@@ -16,6 +16,8 @@ func init() {
 	rootCmd.AddCommand(cmd.ListCmd)
 	rootCmd.AddCommand(cmd.ChatCmd)
 	rootCmd.AddCommand(cmd.IPCmd)
+	rootCmd.AddCommand(cmd.SendCmd)
+	rootCmd.AddCommand(cmd.ReceiveCmd)
 	rootCmd.AddCommand(cmd.VersionCmd)
 }
 

@@ -20,9 +20,14 @@ func KeepAlive(conn *net.UDPConn, peerAddr *net.UDPAddr) {
 	}
 }
 
-func WatchConnection(conn *net.UDPConn) error {
+// WatchConnection monitors for activity. hasPeers returns true when there are
+// currently connected peers — the timeout only fires when peers exist but are silent.
+func WatchConnection(conn *net.UDPConn, hasPeers func() bool) error {
 	for {
 		time.Sleep(30 * time.Second)
+		if !hasPeers() {
+			continue
+		}
 		mu.Lock()
 		since := time.Since(lastSeen)
 		mu.Unlock()

@@ -322,7 +322,14 @@ var ConnectCmd = &cobra.Command{
 					first = false
 					go network.KeepAliveAll(peerConn)
 					go func() {
-						if err := network.WatchConnection(conn); err != nil {
+						if err := network.WatchConnection(conn, func() bool {
+							hasPeers := false
+							virtualIPMap.Range(func(k, v any) bool {
+								hasPeers = true
+								return false
+							})
+							return hasPeers
+						}); err != nil {
 							closeQuit()
 						}
 					}()

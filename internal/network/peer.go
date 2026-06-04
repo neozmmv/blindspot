@@ -96,6 +96,9 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 			UpdateLastSeen()
 			p.conn.WriteToUDP([]byte{PacketPong}, addr)
 			continue
+		case PacketPong:
+			UpdateLastSeen()
+			continue
 		case PacketDead:
 			p.mu.Lock()
 			delete(p.sharedKeys, addr.String())
@@ -146,6 +149,12 @@ func (p *PeerConn) Broadcast(data []byte) {
 // BroadcastRaw sends raw data without encrypting or adding packet type
 // for sending bytes that are already formatted with packet type, like PacketDead
 // NOT ENCRYPTED!
+func (p *PeerConn) HasPeers() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.sharedKeys) > 0
+}
+
 func (p *PeerConn) BroadcastRaw(data []byte) {
 	p.mu.Lock()
 	peers := make([]*net.UDPAddr, len(p.peers))

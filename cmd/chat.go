@@ -162,7 +162,7 @@ var ChatCmd = &cobra.Command{
 
 		// watch connection
 		go func() {
-			if err := network.WatchConnection(conn); err != nil {
+			if err := network.WatchConnection(conn, peerConn.HasPeers); err != nil {
 				fmt.Println("Connection lost, exiting chat...")
 				close(quit)
 			}

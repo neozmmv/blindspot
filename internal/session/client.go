@@ -44,7 +44,7 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) ([]Pee
 		defer res.Body.Close()
 		var createRes map[string]string
 		json.NewDecoder(res.Body).Decode(&createRes)
-		if createRes["error"] != "" {
+		if createRes["error"] != "" && createRes["error"] != "session already exists" {
 			return nil, fmt.Errorf("failed to create session: %s", createRes["error"])
 		}
 	}

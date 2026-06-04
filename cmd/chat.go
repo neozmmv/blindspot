@@ -78,6 +78,15 @@ var ChatCmd = &cobra.Command{
 
 		quit := make(chan struct{})
 
+		// handle Ctrl+C — set up early so quit is closed even while waiting for peers
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt)
+		go func() {
+			<-sigCh
+			fmt.Println("\nDisconnecting...")
+			close(quit)
+		}()
+
 		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
 		go func() {
 			for peer := range peerStream {
@@ -131,7 +140,11 @@ var ChatCmd = &cobra.Command{
 		}()
 
 		fmt.Println("Waiting for peers...")
-		<-atLeastOne
+		select {
+		case <-atLeastOne:
+		case <-quit:
+			return
+		}
 		fmt.Println("Connected! Type to chat.")
 
 		go network.KeepAliveAll(peerConn)
@@ -142,15 +155,6 @@ var ChatCmd = &cobra.Command{
 				fmt.Println("Connection lost, exiting chat...")
 				close(quit)
 			}
-		}()
-
-		// handle Ctrl+C
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt)
-		go func() {
-			<-sigCh
-			fmt.Println("\nDisconnecting...")
-			close(quit)
 		}()
 
 		// reads from stdin

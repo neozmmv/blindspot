@@ -9,4 +9,5 @@ const (
 	PacketData  byte = 0x04
 	PacketDead  byte = 0x05
 	PacketACK   byte = 0x06
+	PacketTun   byte = 0x07
 )

@@ -1,1 +1,3 @@
 dist
+*.exe
+wintun.dll

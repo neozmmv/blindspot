@@ -116,7 +116,7 @@ var ChatCmd = &cobra.Command{
 		// single read loop
 		go func() {
 			for {
-				plaintext, addr, err := peerConn.Read()
+				pktType, plaintext, addr, err := peerConn.Read()
 				if err != nil {
 					if strings.Contains(err.Error(), "peer is dead") {
 						fmt.Printf("\n[%s] disconnected.\n> ", addr)
@@ -125,6 +125,9 @@ var ChatCmd = &cobra.Command{
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
 					}
+					continue
+				}
+				if pktType != network.PacketData {
 					continue
 				}
 				// go time format is the dumbest thing i've ever seen

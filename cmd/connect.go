@@ -13,6 +13,7 @@ import (
 
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
+	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
 	"github.com/spf13/cobra"
 )
@@ -52,13 +53,23 @@ var ConnectCmd = &cobra.Command{
 			statusPath := tmp.Name()
 
 			childArgs := append(os.Args[1:], "--daemon", "--status-file="+statusPath)
-			child := exec.Command(os.Args[0], childArgs...)
-			child.Stdin = nil
-			child.Stdout = nil
-			child.Stderr = nil
-			if err := child.Start(); err != nil {
-				fmt.Println("Error starting background process:", err)
-				return
+
+			var child *exec.Cmd
+			if !bstun.IsAdmin() {
+				// not elevated — trigger UAC prompt and launch as admin
+				if err := bstun.RelaunchAsAdmin(childArgs); err != nil {
+					fmt.Println("Failed to request admin privileges:", err)
+					return
+				}
+			} else {
+				child = exec.Command(os.Args[0], childArgs...)
+				child.Stdin = nil
+				child.Stdout = nil
+				child.Stderr = nil
+				if err := child.Start(); err != nil {
+					fmt.Println("Error starting background process:", err)
+					return
+				}
 			}
 
 			deadline := time.Now().Add(30 * time.Second)
@@ -70,14 +81,18 @@ var ConnectCmd = &cobra.Command{
 						fmt.Printf("Connected to network %s\n", sessionId)
 					} else {
 						fmt.Printf("Failed to connect: %s\n", msg)
-						child.Process.Kill()
+						if child != nil {
+							child.Process.Kill()
+						}
 					}
 					return
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
 			fmt.Println("Timed out waiting for connection.")
-			child.Process.Kill()
+			if child != nil {
+				child.Process.Kill()
+			}
 			return
 		}
 
@@ -115,6 +130,7 @@ var ConnectCmd = &cobra.Command{
 		// from here on, defer owns all cleanup
 		var (
 			peerConn   *network.PeerConn
+			tunDevice  bstun.Device
 			registered bool
 		)
 		quit := make(chan struct{})
@@ -122,6 +138,9 @@ var ConnectCmd = &cobra.Command{
 		closeQuit := func() { quitOnce.Do(func() { close(quit) }) }
 
 		defer func() {
+			if tunDevice != nil {
+				tunDevice.Close()
+			}
 			if registered {
 				session.Leave(hostname, sessionId, password, publicAddr)
 			}
@@ -139,6 +158,13 @@ var ConnectCmd = &cobra.Command{
 			return
 		}
 		registered = true
+
+		myVirtualIP := bstun.VirtualIPv4(publicKey)
+		tunDevice, err = bstun.Create(myVirtualIP)
+		if err != nil {
+			writeStatus("error: creating TUN interface: " + err.Error())
+			return
+		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
 		peerConn = network.NewPeerConn(conn, privateKey, publicKey)
@@ -177,16 +203,52 @@ var ConnectCmd = &cobra.Command{
 			}
 		}()
 
+		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing
+		var virtualIPMap sync.Map
+
+		// UDP → TUN: decrypt incoming packets and write into the TUN interface
 		go func() {
 			for {
-				_, _, err := peerConn.Read()
+				pktType, plaintext, _, err := peerConn.Read()
 				if err != nil {
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
 					}
 					continue
 				}
+				if pktType != network.PacketTun {
+					continue
+				}
 				network.UpdateLastSeen()
+				tunDevice.Write([][]byte{plaintext}, 0)
+			}
+		}()
+
+		// TUN → UDP: read outbound IP packets and route to the right peer
+		go func() {
+			batchSize := tunDevice.BatchSize()
+			bufs := make([][]byte, batchSize)
+			sizes := make([]int, batchSize)
+			for i := range bufs {
+				bufs[i] = make([]byte, 1500)
+			}
+			for {
+				n, err := tunDevice.Read(bufs, sizes, 0)
+				if err != nil {
+					return // TUN closed
+				}
+				for i := 0; i < n; i++ {
+					packet := bufs[i][:sizes[i]]
+					if len(packet) < 20 || packet[0]>>4 != 4 {
+						continue // not an IPv4 packet
+					}
+					destIP := net.IP(packet[16:20]).String()
+					addrVal, ok := virtualIPMap.Load(destIP)
+					if !ok {
+						continue // no peer with that virtual IP
+					}
+					peerConn.SendTun(addrVal.(*net.UDPAddr), packet)
+				}
 			}
 		}()
 
@@ -216,17 +278,23 @@ var ConnectCmd = &cobra.Command{
 
 		writeStatus("ok")
 
-		// start keepalive and watchdog only after first peer connects
+		// on each new peer: register their virtual IP and (for the first peer) start keepalive/watchdog
 		go func() {
-			for range peerConn.Connected {
+			first := true
+			for addr := range peerConn.Connected {
 				network.UpdateLastSeen()
-				go network.KeepAliveAll(peerConn)
-				go func() {
-					if err := network.WatchConnection(conn); err != nil {
-						closeQuit()
-					}
-				}()
-				return
+				if pubKey, ok := peerConn.PeerPublicKey(addr); ok {
+					virtualIPMap.Store(bstun.VirtualIPv4(pubKey), addr)
+				}
+				if first {
+					first = false
+					go network.KeepAliveAll(peerConn)
+					go func() {
+						if err := network.WatchConnection(conn); err != nil {
+							closeQuit()
+						}
+					}()
+				}
 			}
 		}()
 

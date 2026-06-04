@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -20,6 +21,25 @@ import (
 
 func sessionPIDFile() string  { return filepath.Join(utils.GetBlindspotDir(), "session.pid") }
 func sessionStopFile() string { return filepath.Join(utils.GetBlindspotDir(), "session.stop") }
+func peersFile() string       { return filepath.Join(utils.GetBlindspotDir(), "peers.json") }
+
+type PeerEntry struct {
+	VirtualIP  string `json:"virtual_ip"`
+	PublicAddr string `json:"public_addr"`
+}
+
+func writePeers(m *sync.Map) {
+	var entries []PeerEntry
+	m.Range(func(k, v any) bool {
+		entries = append(entries, PeerEntry{
+			VirtualIP:  k.(string),
+			PublicAddr: v.(*net.UDPAddr).String(),
+		})
+		return true
+	})
+	data, _ := json.Marshal(entries)
+	os.WriteFile(peersFile(), data, 0600)
+}
 
 var ConnectCmd = &cobra.Command{
 	Use:   "connect",
@@ -150,6 +170,7 @@ var ConnectCmd = &cobra.Command{
 			conn.Close()
 			os.Remove(pidFile)
 			os.Remove(sessionStopFile())
+			os.Remove(peersFile())
 		}()
 
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, isNew)
@@ -209,10 +230,20 @@ var ConnectCmd = &cobra.Command{
 		// UDP → TUN: decrypt incoming packets and write into the TUN interface
 		go func() {
 			for {
-				pktType, plaintext, _, err := peerConn.Read()
+				pktType, plaintext, addr, err := peerConn.Read()
 				if err != nil {
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
+					}
+					if strings.Contains(err.Error(), "peer is dead") && addr != nil {
+						virtualIPMap.Range(func(k, v any) bool {
+							if v.(*net.UDPAddr).String() == addr.String() {
+								virtualIPMap.Delete(k)
+								return false
+							}
+							return true
+						})
+						writePeers(&virtualIPMap)
 					}
 					continue
 				}
@@ -285,6 +316,7 @@ var ConnectCmd = &cobra.Command{
 				network.UpdateLastSeen()
 				if pubKey, ok := peerConn.PeerPublicKey(addr); ok {
 					virtualIPMap.Store(bstun.VirtualIPv4(pubKey), addr)
+					writePeers(&virtualIPMap)
 				}
 				if first {
 					first = false

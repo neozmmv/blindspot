@@ -21,9 +21,9 @@ var ChatCmd = &cobra.Command{
 		hostname, _ := cmd.Flags().GetString("hostname")
 		sessionId, _ := cmd.Flags().GetString("session")
 		password, _ := cmd.Flags().GetString("password")
-		create, _ := cmd.Flags().GetBool("create")
+		new, _ := cmd.Flags().GetBool("new")
 
-		if len(password) < 8 && create {
+		if len(password) < 8 && new {
 			fmt.Println("Password must be at least 8 characters long")
 			return
 		}
@@ -47,7 +47,7 @@ var ChatCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, new)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
 			conn.Close()
@@ -201,6 +201,6 @@ func init() {
 	ChatCmd.Flags().StringP("hostname", "H", "", "Rendezvous server hostname")
 	ChatCmd.Flags().StringP("session", "s", "", "Session ID")
 	ChatCmd.Flags().StringP("password", "p", "", "Session password")
-	ChatCmd.Flags().BoolP("create", "c", false, "Create session with password")
+	ChatCmd.Flags().BoolP("new", "n", false, "Create new session with password")
 	ChatCmd.MarkFlagRequired("session")
 }

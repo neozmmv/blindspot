@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/neozmmv/blindspot/internal/network"
@@ -20,7 +22,11 @@ var ConnectCmd = &cobra.Command{
 		password, _ := cmd.Flags().GetString("password")
 		create, _ := cmd.Flags().GetBool("create")
 
-		// loads identity (private key + public key)
+		if len(password) < 8 && create {
+			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
 		privateKey, publicKey, err := utils.ReadIdentity()
 		if err != nil {
 			keyPair, err := utils.InitIdentity()
@@ -32,28 +38,32 @@ var ConnectCmd = &cobra.Command{
 			publicKey = keyPair.PublicKey
 		}
 
-		// open UDP connection and get public address
 		conn, publicAddr, err := network.OpenUDPConn()
 		if err != nil {
 			fmt.Println("Error opening UDP connection:", err)
 			return
 		}
-		defer conn.Close()
 
 		fmt.Println("Public addr:", publicAddr)
 
-		// register with the rendezvous server
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, create)
 		if err != nil {
 			fmt.Println("Error registering:", err)
+			conn.Close()
 			return
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-
 		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
 
-		// hole punching with all peers
+		defer func() {
+			session.Leave(hostname, sessionId, password, publicAddr)
+			peerConn.BroadcastRaw([]byte{network.PacketDead})
+			conn.Close()
+		}()
+
+		knownPeers := make(map[string]bool)
+
 		for _, peer := range peers {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
@@ -66,26 +76,87 @@ var ConnectCmd = &cobra.Command{
 				continue
 			}
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
+			knownPeers[peerAddrStr] = true
 			go peerConn.PunchHole(peerAddr)
 		}
 
-		// listens for HELLO from peers
+		quit := make(chan struct{})
 
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt)
 		go func() {
-			for {
-				peerConn.Read()
+			<-sigCh
+			fmt.Println("\nDisconnecting...")
+			close(quit)
+		}()
+
+		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
+		go func() {
+			for peer := range peerStream {
+				peerAddrStr := peer.Public
+				if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
+					peerAddrStr = peer.Local
+				}
+				if knownPeers[peerAddrStr] {
+					continue
+				}
+				knownPeers[peerAddrStr] = true
+				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
+				if err != nil {
+					continue
+				}
+				fmt.Printf("\nNew peer discovered: %s\n", peerAddrStr)
+				go peerConn.PunchHole(peerAddr)
 			}
 		}()
 
-		// wait for first peer to connect
-		connectedAddr := <-peerConn.Connected
-		fmt.Printf("%s connected!\n", connectedAddr)
-		network.UpdateLastSeen()
+		go func() {
+			for {
+				_, addr, err := peerConn.Read()
+				if err != nil {
+					if strings.Contains(err.Error(), "peer is dead") {
+						fmt.Printf("\n[%s] disconnected.\n", addr)
+						continue
+					}
+					if strings.Contains(err.Error(), "use of closed network connection") {
+						return
+					}
+					continue
+				}
+				network.UpdateLastSeen()
+			}
+		}()
 
-		// just block to keep the connection
-		// this will be the vpn connection
-		// not fully done yet
-		select {}
+		atLeastOne := make(chan struct{}, 1)
+		go func() {
+			for addr := range peerConn.Connected {
+				fmt.Printf("\n%s joined!\n", addr)
+				network.UpdateLastSeen()
+				select {
+				case atLeastOne <- struct{}{}:
+				default:
+				}
+			}
+		}()
+
+		fmt.Println("Waiting for peers...")
+		select {
+		case <-atLeastOne:
+		case <-quit:
+			return
+		}
+		fmt.Println("Connected!")
+
+		go network.KeepAliveAll(peerConn)
+
+		go func() {
+			if err := network.WatchConnection(conn); err != nil {
+				fmt.Println("Connection lost, exiting...")
+				close(quit)
+			}
+		}()
+
+		<-quit
 	},
 }
 

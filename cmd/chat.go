@@ -23,6 +23,11 @@ var ChatCmd = &cobra.Command{
 		password, _ := cmd.Flags().GetString("password")
 		create, _ := cmd.Flags().GetBool("create")
 
+		if len(password) < 8 && create {
+			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
 		privateKey, publicKey, err := utils.ReadIdentity()
 		if err != nil {
 			keyPair, err := utils.InitIdentity()

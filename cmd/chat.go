@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
@@ -126,7 +127,9 @@ var ChatCmd = &cobra.Command{
 					}
 					continue
 				}
-				fmt.Printf("\n[%s]: %s\n> ", addr, string(plaintext))
+				// go time format is the dumbest thing i've ever seen
+				// like wdym "15:04:05" instead of like "HH:mm:ss"
+				fmt.Printf("\n[%s] - [%s]: %s\n> ", time.Now().Format(time.TimeOnly), addr, string(plaintext))
 				network.UpdateLastSeen()
 			}
 		}()

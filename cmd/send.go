@@ -56,12 +56,20 @@ var SendCmd = &cobra.Command{
 			return
 		}
 
-		fmt.Printf("Sending %s (%d bytes) to %s...\n", info.Name(), info.Size(), peerIP)
-		n, err := io.Copy(conn, f)
+		fmt.Printf("Sending %s (%s) to %s...\n", info.Name(), formatBytes(float64(info.Size())), peerIP)
+		pw := &progressWriter{w: conn}
+		stop := startProgress(info.Size(), pw)
+		start := time.Now()
+		n, err := io.Copy(pw, f)
+		stop()
+		fmt.Println()
 		if err != nil {
 			fmt.Println("Error sending file:", err)
 			return
 		}
-		fmt.Printf("Sent %d bytes.\n", n)
+		elapsed := time.Since(start)
+		fmt.Printf("Done — %s in %s (avg %s/s)\n",
+			formatBytes(float64(n)), elapsed.Round(time.Millisecond),
+			formatBytes(float64(n)/elapsed.Seconds()))
 	},
 }

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -90,12 +91,20 @@ var ReceiveCmd = &cobra.Command{
 		}
 		defer f.Close()
 
-		n, err := io.CopyN(f, conn, int64(fileSize))
+		pw := &progressWriter{w: f}
+		stop := startProgress(int64(fileSize), pw)
+		start := time.Now()
+		n, err := io.CopyN(pw, conn, int64(fileSize))
+		stop()
+		fmt.Println()
 		if err != nil {
 			fmt.Printf("Error receiving file (got %d/%d bytes): %v\n", n, fileSize, err)
 			return
 		}
-		fmt.Printf("Saved to %s (%d bytes).\n", destPath, n)
+		elapsed := time.Since(start)
+		fmt.Printf("Saved to %s — %s in %s (avg %s/s)\n",
+			destPath, formatBytes(float64(n)), elapsed.Round(time.Millisecond),
+			formatBytes(float64(n)/elapsed.Seconds()))
 	},
 }
 

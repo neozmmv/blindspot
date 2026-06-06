@@ -8,17 +8,26 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// batch workaround to replace the current executable on next run
 var pwshScript = `
 $ErrorActionPreference = "Stop"
-
 $Url  = "https://github.com/neozmmv/blindspot/releases/latest/download/blindspot.exe"
 $Dest = "$env:LOCALAPPDATA\Microsoft\WindowsApps\blindspot.exe"
+$Tmp  = "$env:TEMP\blindspot_update.exe"
 
 Write-Host "Downloading latest blindspot..."
-Invoke-WebRequest -Uri $Url -OutFile $Dest
+Invoke-WebRequest -Uri $Url -OutFile $Tmp
 
-Write-Host "Installed to $Dest"
-Write-Host "Run 'blindspot' from any terminal."
+$batch = "$env:TEMP\blindspot_update.bat"
+@"
+@echo off
+timeout /t 1 /nobreak >nul
+move /y "$Tmp" "$Dest"
+del "%~f0"
+"@ | Out-File -FilePath $batch -Encoding ascii
+
+Start-Process -FilePath $batch -WindowStyle Hidden
+Write-Host "Update downloaded. Applying on next run."
 `
 
 func init() {

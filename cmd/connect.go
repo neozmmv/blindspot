@@ -44,6 +44,7 @@ func writePeers(m *sync.Map) {
 var ConnectCmd = &cobra.Command{
 	Use:   "connect",
 	Short: "Connect to a blindspot network",
+
 	Run: func(cmd *cobra.Command, args []string) {
 		hostname, _ := cmd.Flags().GetString("hostname")
 		sessionId, _ := cmd.Flags().GetString("session")
@@ -51,6 +52,10 @@ var ConnectCmd = &cobra.Command{
 		isNew, _ := cmd.Flags().GetBool("new")
 		daemon, _ := cmd.Flags().GetBool("daemon")
 		statusFile, _ := cmd.Flags().GetString("status-file")
+		bsDir, _ := cmd.Flags().GetString("dir")
+		if bsDir != "" {
+			utils.SetBlindspotDir(bsDir)
+		}
 
 		if len(password) < 8 && isNew {
 			fmt.Println("Password must be at least 8 characters long")
@@ -72,7 +77,7 @@ var ConnectCmd = &cobra.Command{
 			os.Remove(tmp.Name())
 			statusPath := tmp.Name()
 
-			childArgs := append(os.Args[1:], "--daemon", "--status-file="+statusPath)
+			childArgs := append(os.Args[1:], "--daemon", "--status-file="+statusPath, "--dir="+utils.GetBlindspotDir())
 
 			var child *exec.Cmd
 			if !bstun.IsAdmin() {
@@ -343,12 +348,14 @@ var ConnectCmd = &cobra.Command{
 
 func init() {
 	ConnectCmd.Flags().StringP("hostname", "H", "", "Rendezvous server hostname")
-	ConnectCmd.Flags().StringP("session", "s", "", "Session ID")
+	ConnectCmd.Flags().StringP("session", "s", "", "Network ID")
 	ConnectCmd.Flags().StringP("password", "p", "", "Session password")
-	ConnectCmd.Flags().BoolP("new", "n", false, "Create new session with password")
+	ConnectCmd.Flags().BoolP("new", "n", false, "Create new network with password")
 	ConnectCmd.MarkFlagRequired("session")
 	ConnectCmd.Flags().Bool("daemon", false, "")
 	ConnectCmd.Flags().String("status-file", "", "")
+	ConnectCmd.Flags().String("dir", "", "")
 	ConnectCmd.Flags().MarkHidden("daemon")
 	ConnectCmd.Flags().MarkHidden("status-file")
+	ConnectCmd.Flags().MarkHidden("dir")
 }

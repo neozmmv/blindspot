@@ -15,7 +15,16 @@ type Identity struct {
 	PublicKey  string `json:"public_key"`
 }
 
+var blindspotDirOverride string
+
+func SetBlindspotDir(dir string) {
+	blindspotDirOverride = dir
+}
+
 func GetBlindspotDir() string {
+	if blindspotDirOverride != "" {
+		return blindspotDirOverride
+	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)

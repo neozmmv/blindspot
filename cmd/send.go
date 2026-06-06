@@ -41,6 +41,10 @@ var SendCmd = &cobra.Command{
 			return
 		}
 		defer conn.Close()
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetWriteBuffer(1 << 20) // 1 MB
+			tc.SetReadBuffer(1 << 20)
+		}
 
 		name := []byte(filepath.Base(filePath))
 		if err := binary.Write(conn, binary.BigEndian, uint16(len(name))); err != nil {
@@ -57,10 +61,12 @@ var SendCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Sending %s (%s) to %s...\n", info.Name(), formatBytes(float64(info.Size())), peerIP)
-		pw := &progressWriter{w: conn}
-		stop := startProgress(info.Size(), pw)
+		// wrap the file (not the conn) so the dst stays a bare *net.TCPConn
+		// and the Go runtime can use sendfile(2) for zero-copy transfer
+		pr := &progressReader{r: f}
+		stop := startProgress(info.Size(), pr)
 		start := time.Now()
-		n, err := io.Copy(pw, f)
+		n, err := io.Copy(conn, pr)
 		stop()
 		fmt.Println()
 		if err != nil {

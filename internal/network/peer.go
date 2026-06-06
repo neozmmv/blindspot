@@ -13,8 +13,9 @@ type PeerConn struct {
 	conn           *net.UDPConn
 	privateKey     []byte
 	publicKey      []byte
-	sharedKeys     map[string][]byte // addr → sharedKey
-	peerPublicKeys map[string][]byte // addr → peerPublicKey
+	sharedKeys     map[string][]byte        // addr → sharedKey (kept for reference)
+	aeads          map[string]*crypto.AEAD  // addr → cached AEAD (hot path)
+	peerPublicKeys map[string][]byte        // addr → peerPublicKey
 	peers          []*net.UDPAddr
 	mu             sync.Mutex
 	Connected      chan *net.UDPAddr // signals when a new peer connects
@@ -26,6 +27,7 @@ func NewPeerConn(conn *net.UDPConn, privateKey, publicKey []byte) *PeerConn {
 		privateKey:     privateKey,
 		publicKey:      publicKey,
 		sharedKeys:     map[string][]byte{},
+		aeads:          map[string]*crypto.AEAD{},
 		peerPublicKeys: map[string][]byte{},
 		Connected:      make(chan *net.UDPAddr, 10),
 	}
@@ -36,8 +38,13 @@ func (p *PeerConn) AddPeer(addr *net.UDPAddr, peerPublicKey []byte) error {
 	if err != nil {
 		return err
 	}
+	aead, err := crypto.NewAEAD(sharedKey)
+	if err != nil {
+		return err
+	}
 	p.mu.Lock()
 	p.sharedKeys[addr.String()] = sharedKey
+	p.aeads[addr.String()] = aead
 	p.peerPublicKeys[addr.String()] = peerPublicKey
 	p.peers = append(p.peers, addr)
 	p.mu.Unlock()
@@ -55,12 +62,15 @@ func (p *PeerConn) PeerPublicKey(addr *net.UDPAddr) ([]byte, bool) {
 
 func (p *PeerConn) send(addr *net.UDPAddr, data []byte, pktType byte) error {
 	p.mu.Lock()
-	sharedKey, ok := p.sharedKeys[addr.String()]
+	aead, ok := p.aeads[addr.String()]
 	p.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("unknown peer: %s", addr)
 	}
-	return SendToPeer(p.conn, addr, sharedKey, data, pktType)
+	encrypted := aead.Encrypt(data)
+	packet := append([]byte{pktType}, encrypted...)
+	_, err := p.conn.WriteToUDP(packet, addr)
+	return err
 }
 
 func (p *PeerConn) Send(addr *net.UDPAddr, data []byte) error {
@@ -102,16 +112,17 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 		case PacketDead:
 			p.mu.Lock()
 			delete(p.sharedKeys, addr.String())
+			delete(p.aeads, addr.String())
 			p.mu.Unlock()
 			return PacketDead, nil, addr, fmt.Errorf("peer is dead")
 		case PacketData, PacketTun:
 			p.mu.Lock()
-			sharedKey, ok := p.sharedKeys[addr.String()]
+			aead, ok := p.aeads[addr.String()]
 			p.mu.Unlock()
 			if !ok {
 				continue
 			}
-			plaintext, err := crypto.DecryptBytes(sharedKey, buf[1:n])
+			plaintext, err := aead.Decrypt(buf[1:n])
 			if err != nil {
 				continue
 			}

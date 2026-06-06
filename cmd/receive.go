@@ -62,6 +62,10 @@ var ReceiveCmd = &cobra.Command{
 			return
 		}
 		defer conn.Close()
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetReadBuffer(1 << 20) // 1 MB
+			tc.SetWriteBuffer(1 << 20)
+		}
 
 		var nameLen uint16
 		if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
@@ -94,7 +98,8 @@ var ReceiveCmd = &cobra.Command{
 		pw := &progressWriter{w: f}
 		stop := startProgress(int64(fileSize), pw)
 		start := time.Now()
-		n, err := io.CopyN(pw, conn, int64(fileSize))
+		buf := make([]byte, 256*1024) // 256 KB — fewer syscalls vs default 32 KB
+		n, err := io.CopyBuffer(pw, io.LimitReader(conn, int64(fileSize)), buf)
 		stop()
 		fmt.Println()
 		if err != nil {

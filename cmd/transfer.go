@@ -18,9 +18,31 @@ func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+// progressReader wraps a reader and counts bytes read.
+// Use this on the send side so the dst stays a bare *net.TCPConn,
+// allowing the Go runtime to use the sendfile(2) syscall (zero-copy).
+type progressReader struct {
+	r     io.Reader
+	bytes atomic.Int64
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.r.Read(p)
+	pr.bytes.Add(int64(n))
+	return
+}
+
+func (pr *progressReader) bytesRead() int64 { return pr.bytes.Load() }
+
+type byteCounter interface {
+	bytesRead() int64
+}
+
+func (pw *progressWriter) bytesRead() int64 { return pw.bytes.Load() }
+
 // startProgress starts a goroutine that prints a live speed/ETA line.
 // Call the returned stop func when the transfer is done.
-func startProgress(total int64, pw *progressWriter) func() {
+func startProgress(total int64, pw byteCounter) func() {
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -32,7 +54,7 @@ func startProgress(total int64, pw *progressWriter) func() {
 			case <-done:
 				return
 			case t := <-ticker.C:
-				current := pw.bytes.Load()
+				current := pw.bytesRead()
 				delta := current - lastBytes
 				elapsed := t.Sub(lastTick)
 				lastBytes = current

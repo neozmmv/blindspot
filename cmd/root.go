@@ -1,0 +1,36 @@
+package cmd
+
+import (
+	"github.com/spf13/cobra"
+)
+
+var rootCmd = &cobra.Command{
+	Use: "blindspot",
+	Short: `
+██████╗ ██╗     ██╗███╗   ██╗██████╗ ███████╗██████╗  ██████╗ ████████╗
+██╔══██╗██║     ██║████╗  ██║██╔══██╗██╔════╝██╔══██╗██╔═══██╗╚══██╔══╝
+██████╔╝██║     ██║██╔██╗ ██║██║  ██║███████╗██████╔╝██║   ██║   ██║   
+██╔══██╗██║     ██║██║╚██╗██║██║  ██║╚════██║██╔═══╝ ██║   ██║   ██║   
+██████╔╝███████╗██║██║ ╚████║██████╔╝███████║██║     ╚██████╔╝   ██║   
+╚═════╝ ╚══════╝╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝      ╚═════╝    ╚═╝   
+                                                                                       
+P2P Toolkit: VPN, File Sharing, Chat, and More
+	`,
+}
+
+func init() {
+	// since in the same package
+	// we can lowercase all of them later
+	rootCmd.AddCommand(ConnectCmd)
+	rootCmd.AddCommand(DisconnectCmd)
+	rootCmd.AddCommand(ListCmd)
+	rootCmd.AddCommand(ChatCmd)
+	rootCmd.AddCommand(IPCmd)
+	rootCmd.AddCommand(SendCmd)
+	rootCmd.AddCommand(ReceiveCmd)
+	rootCmd.AddCommand(VersionCmd)
+}
+
+func Execute() error {
+	return rootCmd.Execute()
+}

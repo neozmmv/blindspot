@@ -96,7 +96,7 @@ Pre-built binaries are also available directly on the [releases page](https://gi
 
 ### VPN mode — `connect` / `disconnect`
 
-Creates a virtual network adapter (`blindspot`, `10.x.x.x/8`) and connects all peers on the same session into a mesh. Once connected, peers see each other as if they were on the same LAN — file sharing (SMB), RDP, ping, and any other protocol work transparently.
+Creates a virtual network adapter (`blindspot`, `10.x.x.x/8`) and connects all peers on the same session into a mesh. Once connected, peers see each other as if they were on the same LAN — file sharing, RDP, ping, and any other protocol work transparently.
 
 ```bash
 # peer A — creates a password-protected session and connects

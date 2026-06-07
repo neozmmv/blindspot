@@ -161,6 +161,7 @@ var ConnectCmd = &cobra.Command{
 			if tunDevice != nil {
 				tunDevice.Close()
 			}
+			exec.Command("route", "delete", "10.0.0.0", "mask", "255.0.0.0").Run() // best effort cleanup of route
 			if registered {
 				session.Leave(hostname, sessionId, password, publicAddr)
 			}

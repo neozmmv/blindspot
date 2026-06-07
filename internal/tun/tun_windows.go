@@ -106,6 +106,40 @@ func Create(virtualIP string) (Device, error) {
 		return nil, fmt.Errorf("assigning IP %s: %w — %s", virtualIP, err, out)
 	}
 
+	// MAKES WINDOWS ROUTE THE TRAFFIC THROUGH THE CORRECT INTERFACE
+	// BY INDEX
+	var ifIdx string
+	for range 5 {
+		idxOut, _ := exec.Command("netsh", "interface", "ipv4",
+			"show", "interfaces").CombinedOutput()
+
+		for _, line := range strings.Split(string(idxOut), "\n") {
+			if strings.Contains(strings.ToLower(line), "blindspot") {
+				fields := strings.Fields(line)
+				if len(fields) >= 1 {
+					ifIdx = fields[0]
+					break
+				}
+			}
+		}
+		if ifIdx != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if ifIdx == "" {
+		device.Close()
+		return nil, fmt.Errorf("could not determine blindspot interface index")
+	}
+
+	// bind route directly to TUN interface index
+	if out, err := exec.Command("route", "add", "10.0.0.0", "mask", "255.0.0.0",
+		"0.0.0.0", "if", ifIdx, "metric", "1").CombinedOutput(); err != nil {
+		device.Close()
+		return nil, fmt.Errorf("error routing through the interface: %w — %s", err, out)
+	}
+
 	// allow all inbound traffic from the virtual network (HTTP, SMB, RDP, etc.)
 	exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=blindspot").Run()
 	exec.Command("netsh", "advfirewall", "firewall", "add", "rule",

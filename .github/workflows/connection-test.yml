@@ -42,7 +42,7 @@ jobs:
 
       - name: Keep connection alive
         if: success()
-        run: sleep 120
+        run: sleep 30 # 120
 
       - name: Disconnect
         if: always()
@@ -79,7 +79,7 @@ jobs:
 
       - name: Keep connection alive
         if: success()
-        run: sleep 120
+        run: sleep 30 # 120
 
       - name: Disconnect
         if: always()
@@ -118,7 +118,7 @@ jobs:
 
       - name: Keep connection alive
         if: success()
-        run: sleep 120
+        run: sleep 30 # 120
 
       - name: Disconnect
         if: always()
@@ -139,7 +139,7 @@ jobs:
       # Both VMs build in ~30s; this sleep ensures peer A has
       # finished connecting before peer B attempts to join.
       - name: Wait for peer A to create the session
-        run: sleep 60
+        run: sleep 30 # 60
 
       # Retry in case the session doesn't exist on the server yet.
       - name: Join session and connect
@@ -171,7 +171,7 @@ jobs:
 
       - name: Keep connection alive
         if: success()
-        run: sleep 120
+        run: sleep 30 # 120
 
       - name: Disconnect
         if: always()

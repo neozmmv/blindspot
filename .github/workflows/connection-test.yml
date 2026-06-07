@@ -1,0 +1,162 @@
+name: blindspot Connection Test
+
+# Tests that two real peers can find each other via the rendezvous server.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # -s (no password) 
+
+  peer-a-session:
+    name: "no-password / peer A"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+      - name: Build
+        run: go build -o blindspot .
+
+      - name: Connect
+        run: sudo ./blindspot connect -s ci-nopass-${{ github.run_id }}
+
+      - name: Wait for peer B (blindspot list)
+        run: |
+          for i in $(seq 1 24); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer B visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/24 — no peer yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "peer B never appeared after 2 minutes"
+          exit 1
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect
+
+  peer-b-session:
+    name: "no-password / peer B"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+      - name: Build
+        run: go build -o blindspot .
+
+      - name: Connect
+        run: sudo ./blindspot connect -s ci-nopass-${{ github.run_id }}
+
+      - name: Wait for peer A (blindspot list)
+        run: |
+          for i in $(seq 1 24); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer A visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/24 — no peer yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "peer A never appeared after 2 minutes"
+          exit 1
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect
+
+  # -s -p (with password)
+
+  peer-a-session-password:
+    name: "with-password / peer A (creates session)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+      - name: Build
+        run: go build -o blindspot .
+
+      - name: Create session and connect
+        run: sudo ./blindspot connect -s ci-pass-${{ github.run_id }} -n -p "CItest1234!"
+
+      - name: Wait for peer B (blindspot list)
+        run: |
+          for i in $(seq 1 24); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer B visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/24 — no peer yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "peer B never appeared after 2 minutes"
+          exit 1
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect
+
+  peer-b-session-password:
+    name: "with-password / peer B (joins session)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+      - name: Build
+        run: go build -o blindspot .
+
+      # Peer A needs to create the session first.
+      # Both VMs build in ~30s; this sleep ensures peer A has
+      # finished connecting before peer B attempts to join.
+      - name: Wait for peer A to create the session
+        run: sleep 60
+
+      # Retry in case the session doesn't exist on the server yet.
+      - name: Join session and connect
+        run: |
+          for i in $(seq 1 8); do
+            if sudo ./blindspot connect -s ci-pass-${{ github.run_id }} -p "CItest1234!"; then
+              exit 0
+            fi
+            echo "attempt $i/8 failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "could not join session after all retries"
+          exit 1
+
+      - name: Wait for peer A (blindspot list)
+        run: |
+          for i in $(seq 1 24); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer A visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/24 — no peer yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "peer A never appeared after 2 minutes"
+          exit 1
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect

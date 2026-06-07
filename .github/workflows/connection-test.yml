@@ -40,6 +40,10 @@ jobs:
           echo "peer B never appeared after 2 minutes"
           exit 1
 
+      - name: Keep connection alive
+        if: success()
+        run: sleep 120
+
       - name: Disconnect
         if: always()
         run: sudo ./blindspot disconnect
@@ -72,6 +76,10 @@ jobs:
           done
           echo "peer A never appeared after 2 minutes"
           exit 1
+
+      - name: Keep connection alive
+        if: success()
+        run: sleep 120
 
       - name: Disconnect
         if: always()
@@ -107,6 +115,10 @@ jobs:
           done
           echo "peer B never appeared after 2 minutes"
           exit 1
+
+      - name: Keep connection alive
+        if: success()
+        run: sleep 120
 
       - name: Disconnect
         if: always()
@@ -156,6 +168,10 @@ jobs:
           done
           echo "peer A never appeared after 2 minutes"
           exit 1
+
+      - name: Keep connection alive
+        if: success()
+        run: sleep 120
 
       - name: Disconnect
         if: always()

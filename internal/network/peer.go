@@ -92,11 +92,12 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 		}
 		switch buf[0] {
 		case PacketHello:
-			peerPublicKey := buf[1:n]
 			p.mu.Lock()
 			_, alreadyConnected := p.sharedKeys[addr.String()]
 			p.mu.Unlock()
 			if !alreadyConnected {
+				peerPublicKey := make([]byte, n-1)
+				copy(peerPublicKey, buf[1:n])
 				p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
 				p.AddPeer(addr, peerPublicKey)
 				go p.PunchHole(addr)

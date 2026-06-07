@@ -78,6 +78,10 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) ([]Pee
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned %s", resp.Status)
+	}
+
 	// server returns {"peers": [{"ip": "...", "local_addr": "..."}]}
 	var respBody struct {
 		Peers []struct {
@@ -158,6 +162,11 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 			return
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("StreamPeers: server returned %s\n", resp.Status)
+			return
+		}
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {

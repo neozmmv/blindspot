@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -50,11 +52,34 @@ var ConnectCmd = &cobra.Command{
 		sessionId, _ := cmd.Flags().GetString("session")
 		password, _ := cmd.Flags().GetString("password")
 		isNew, _ := cmd.Flags().GetBool("new")
+		newRandom, _ := cmd.Flags().GetBool("new-random")
 		daemon, _ := cmd.Flags().GetBool("daemon")
 		statusFile, _ := cmd.Flags().GetString("status-file")
 		bsDir, _ := cmd.Flags().GetString("dir")
 		if bsDir != "" {
 			utils.SetBlindspotDir(bsDir)
+		}
+
+		if newRandom && !daemon {
+			var err error
+			sessionId, err = randomString("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 8)
+			if err != nil {
+				fmt.Println("Error generating session ID:", err)
+				return
+			}
+			password, err = randomString("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+", 16)
+			if err != nil {
+				fmt.Println("Error generating password:", err)
+				return
+			}
+			isNew = true
+			fmt.Printf("Network ID : %s\n", sessionId)
+			fmt.Printf("Password   : %s\n", password)
+		}
+
+		if sessionId == "" {
+			fmt.Println("Network ID is required. Use -s <id> or --new-random (-r).")
+			return
 		}
 
 		if len(password) < 8 && isNew {
@@ -77,7 +102,20 @@ var ConnectCmd = &cobra.Command{
 			os.Remove(tmp.Name())
 			statusPath := tmp.Name()
 
-			childArgs := append(os.Args[1:], "--daemon", "--status-file="+statusPath, "--dir="+utils.GetBlindspotDir())
+			var childArgs []string
+			if newRandom {
+				childArgs = []string{"connect",
+					"--session=" + sessionId,
+					"--password=" + password,
+					"--new",
+				}
+				if hostname != "" {
+					childArgs = append(childArgs, "--hostname="+hostname)
+				}
+			} else {
+				childArgs = os.Args[1:]
+			}
+			childArgs = append(childArgs, "--daemon", "--status-file="+statusPath, "--dir="+utils.GetBlindspotDir())
 
 			var child *exec.Cmd
 			if !bstun.IsAdmin() {
@@ -346,12 +384,24 @@ var ConnectCmd = &cobra.Command{
 	},
 }
 
+func randomString(charset string, n int) (string, error) {
+	b := make([]byte, n)
+	for i := range b {
+		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		b[i] = charset[idx.Int64()]
+	}
+	return string(b), nil
+}
+
 func init() {
 	ConnectCmd.Flags().StringP("hostname", "H", "", "Rendezvous server hostname")
 	ConnectCmd.Flags().StringP("session", "s", "", "Network ID")
 	ConnectCmd.Flags().StringP("password", "p", "", "Session password")
 	ConnectCmd.Flags().BoolP("new", "n", false, "Create new network with password")
-	ConnectCmd.MarkFlagRequired("session")
+	ConnectCmd.Flags().BoolP("new-random", "r", false, "Create new network with random ID and password")
 	ConnectCmd.Flags().Bool("daemon", false, "")
 	ConnectCmd.Flags().String("status-file", "", "")
 	ConnectCmd.Flags().String("dir", "", "")

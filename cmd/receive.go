@@ -82,7 +82,7 @@ var ReceiveCmd = &cobra.Command{
 
 		filename := string(nameBuf)
 		destPath := filepath.Join(destDir, filename)
-		fmt.Printf("Receiving %s (%d bytes) from %s...\n", filename, fileSize, conn.RemoteAddr())
+		fmt.Printf("Receiving %s (%d MB) from %s...\n", filename, fileSize/(1024*1024), conn.RemoteAddr())
 
 		f, err := os.Create(destPath)
 		if err != nil {

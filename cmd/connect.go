@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/neozmmv/blindspot/internal/network"
@@ -228,6 +229,24 @@ var ConnectCmd = &cobra.Command{
 		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing
 		var virtualIPMap sync.Map
 
+		go func() {
+			for {
+				select {
+				case <-quit:
+					return
+				case addr := <-peerConn.Dead:
+					virtualIPMap.Range(func(k, v any) bool {
+						if v.(*net.UDPAddr).String() == addr.String() {
+							virtualIPMap.Delete(k)
+							return false
+						}
+						return true
+					})
+					writePeers(&virtualIPMap)
+				}
+			}
+		}()
+
 		// UDP → TUN: decrypt incoming packets and write into the TUN interface
 		go func() {
 			for {
@@ -302,7 +321,7 @@ var ConnectCmd = &cobra.Command{
 		}()
 
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		go func() {
 			<-sigCh
 			closeQuit()

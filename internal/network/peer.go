@@ -16,8 +16,10 @@ type PeerConn struct {
 	sharedKeys     map[string][]byte // addr → sharedKey
 	peerPublicKeys map[string][]byte // addr → peerPublicKey
 	peers          []*net.UDPAddr
+	missedPings    map[string]int // addr → consecutive unanswered pings
 	mu             sync.Mutex
 	Connected      chan *net.UDPAddr // signals when a new peer connects
+	Dead           chan *net.UDPAddr // signals when a peer is declared dead
 }
 
 func NewPeerConn(conn *net.UDPConn, privateKey, publicKey []byte) *PeerConn {
@@ -27,7 +29,9 @@ func NewPeerConn(conn *net.UDPConn, privateKey, publicKey []byte) *PeerConn {
 		publicKey:      publicKey,
 		sharedKeys:     map[string][]byte{},
 		peerPublicKeys: map[string][]byte{},
+		missedPings:    map[string]int{},
 		Connected:      make(chan *net.UDPAddr, 10),
+		Dead:           make(chan *net.UDPAddr, 10),
 	}
 }
 
@@ -98,6 +102,9 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 			continue
 		case PacketPong:
 			UpdateLastSeen()
+			p.mu.Lock()
+			p.missedPings[addr.String()] = 0
+			p.mu.Unlock()
 			continue
 		case PacketDead:
 			p.mu.Lock()
@@ -117,6 +124,24 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 			}
 			return buf[0], plaintext, addr, nil
 		}
+	}
+}
+
+func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
+	p.mu.Lock()
+	delete(p.sharedKeys, addr.String())
+	delete(p.peerPublicKeys, addr.String())
+	delete(p.missedPings, addr.String())
+	for i, a := range p.peers {
+		if a.String() == addr.String() {
+			p.peers = append(p.peers[:i], p.peers[i+1:]...)
+			break
+		}
+	}
+	p.mu.Unlock()
+	select {
+	case p.Dead <- addr:
+	default:
 	}
 }
 

@@ -51,7 +51,18 @@ func KeepAliveAll(p *PeerConn) {
 		copy(peers, p.peers)
 		p.mu.Unlock()
 		for _, addr := range peers {
+			p.mu.Lock()
+			missed := p.missedPings[addr.String()]
+			p.mu.Unlock()
+			if missed >= 3 {
+				fmt.Printf("Peer %v declared dead (no pong after %d pings)\n", addr, missed)
+				p.RemovePeer(addr)
+				continue
+			}
 			p.conn.WriteToUDP([]byte{PacketPing}, addr)
+			p.mu.Lock()
+			p.missedPings[addr.String()]++
+			p.mu.Unlock()
 		}
 	}
 }

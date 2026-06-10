@@ -12,7 +12,7 @@ var ListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List peers connected to the active session",
 	Run: func(cmd *cobra.Command, args []string) {
-		if _, err := os.Stat(sessionPIDFile()); os.IsNotExist(err) {
+		if !isSessionRunning() {
 			fmt.Println("No active session.")
 			return
 		}

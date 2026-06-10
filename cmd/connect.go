@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +24,24 @@ import (
 func sessionPIDFile() string  { return filepath.Join(utils.GetBlindspotDir(), "session.pid") }
 func sessionStopFile() string { return filepath.Join(utils.GetBlindspotDir(), "session.stop") }
 func peersFile() string       { return filepath.Join(utils.GetBlindspotDir(), "peers.json") }
+
+// isSessionRunning returns true only if the session PID file exists AND the recorded
+// process is still alive. If the file exists but the process is gone (e.g. after an
+// unclean shutdown), the stale files are removed and false is returned.
+func isSessionRunning() bool {
+	data, err := os.ReadFile(sessionPIDFile())
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || !isProcessAlive(pid) {
+		os.Remove(sessionPIDFile())
+		os.Remove(sessionStopFile())
+		os.Remove(peersFile())
+		return false
+	}
+	return true
+}
 
 type PeerEntry struct {
 	VirtualIP  string `json:"virtual_ip"`
@@ -59,7 +78,7 @@ var ConnectCmd = &cobra.Command{
 		}
 
 		if !daemon {
-			if _, err := os.Stat(sessionPIDFile()); err == nil {
+			if isSessionRunning() {
 				fmt.Println("Already connected to a network. Run 'blindspot disconnect' first.")
 				return
 			}
@@ -341,18 +360,6 @@ var ConnectCmd = &cobra.Command{
 				if first {
 					first = false
 					go network.KeepAliveAll(peerConn)
-					go func() {
-						if err := network.WatchConnection(conn, func() bool {
-							hasPeers := false
-							virtualIPMap.Range(func(k, v any) bool {
-								hasPeers = true
-								return false
-							})
-							return hasPeers
-						}); err != nil {
-							closeQuit()
-						}
-					}()
 				}
 			}
 		}()

@@ -54,7 +54,7 @@ func KeepAliveAll(p *PeerConn) {
 			p.mu.Lock()
 			missed := p.missedPings[addr.String()]
 			p.mu.Unlock()
-			if missed >= 3 {
+			if missed >= 9 {
 				fmt.Printf("Peer %v declared dead (no pong after %d pings)\n", addr, missed)
 				p.RemovePeer(addr)
 				continue

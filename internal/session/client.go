@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PeerAddr struct {
@@ -143,44 +144,70 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 	go func() {
 		defer close(ch)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() {
-			<-quit
-			cancel()
-		}()
-
-		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
-		if err != nil {
-			return
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			if scanner.Err() != nil {
-				fmt.Printf("Error while scanning: %s\n", scanner.Err().Error())
-				return
-			}
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			var peer struct {
-				IP        string `json:"ip"`
-				LocalAddr string `json:"local_addr"`
-			}
-			if err := json.Unmarshal([]byte(data), &peer); err != nil {
-				continue
-			}
+		for {
 			select {
-			case ch <- PeerAddr{Public: peer.IP, Local: peer.LocalAddr}:
 			case <-quit:
 				return
+			default:
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				select {
+				case <-quit:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+
+			req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+			if err != nil {
+				cancel()
+				return
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				cancel()
+				select {
+				case <-quit:
+					return
+				case <-time.After(5 * time.Second):
+					continue
+				}
+			}
+
+			scanner := bufio.NewScanner(resp.Body)
+			for scanner.Scan() {
+				if scanner.Err() != nil {
+					break
+				}
+				line := scanner.Text()
+				if !strings.HasPrefix(line, "data:") {
+					continue
+				}
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				var peer struct {
+					IP        string `json:"ip"`
+					LocalAddr string `json:"local_addr"`
+				}
+				if err := json.Unmarshal([]byte(data), &peer); err != nil {
+					continue
+				}
+				select {
+				case ch <- PeerAddr{Public: peer.IP, Local: peer.LocalAddr}:
+				case <-quit:
+					resp.Body.Close()
+					cancel()
+					return
+				}
+			}
+			resp.Body.Close()
+			cancel()
+
+			select {
+			case <-quit:
+				return
+			case <-time.After(5 * time.Second):
 			}
 		}
 	}()

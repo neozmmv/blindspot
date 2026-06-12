@@ -226,6 +226,20 @@ var ConnectCmd = &cobra.Command{
 			go peerConn.PunchHole(peerAddr)
 		}
 
+		// Periodically re-register to keep the rendezvous session TTL alive.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-quit:
+					return
+				case <-ticker.C:
+					session.Register(hostname, sessionId, password, publicAddr, false)
+				}
+			}
+		}()
+
 		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
 		go func() {
 			for peer := range peerStream {

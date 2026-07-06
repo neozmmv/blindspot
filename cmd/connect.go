@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
@@ -186,8 +188,8 @@ var ConnectCmd = &cobra.Command{
 				session.Leave(hostname, sessionId, password, publicAddr)
 			}
 			if peerConn != nil {
-				peerConn.BroadcastRaw([]byte{network.PacketDead})
-				peerConn.Shutdown() // stop any in-flight PunchHole goroutines
+				peerConn.BroadcastRaw([]byte{network.ProtocolVersion, network.PacketDead})
+				peerConn.Shutdown() // stop any in-flight handshake drivers
 			}
 			conn.Close()
 			os.Remove(pidFile)
@@ -195,7 +197,14 @@ var ConnectCmd = &cobra.Command{
 			os.Remove(peersFile())
 		}()
 
-		peers, err := session.Register(hostname, sessionId, password, publicAddr, isNew)
+		// PSK (second factor) from the password via Argon2id, salted with the session
+		// id; prologue binds the Noise handshake to protocol version + session. Our
+		// static pubkey is published to the rendezvous so peers can pin it beforehand.
+		psk := crypto.DerivePSK(password, sessionId)
+		prologue := network.Prologue(sessionId)
+		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, isNew)
 		if err != nil {
 			writeStatus("error: " + err.Error())
 			return
@@ -210,7 +219,7 @@ var ConnectCmd = &cobra.Command{
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn = network.NewPeerConn(conn, privateKey, publicKey)
+		peerConn = network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		knownPeers := make(map[string]bool)
 
@@ -226,8 +235,13 @@ var ConnectCmd = &cobra.Command{
 			if !network.IsValidPeerAddr(peerAddr) {
 				continue // reject broadcast/multicast/unspecified IPs and privileged ports
 			}
+			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+			if err != nil || len(pub) != 32 {
+				continue // no valid pubkey from the rendezvous → cannot handshake
+			}
 			knownPeers[peerAddrStr] = true
-			go peerConn.PunchHole(peerAddr)
+			// Register the rendezvous-pinned static key and kick off the Noise handshake.
+			peerConn.AddKnownPeer(peerAddr, pub)
 		}
 
 		// Periodically re-register to keep the rendezvous session TTL alive.
@@ -239,7 +253,7 @@ var ConnectCmd = &cobra.Command{
 				case <-quit:
 					return
 				case <-ticker.C:
-					session.Register(hostname, sessionId, password, publicAddr, false)
+					session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, false)
 				}
 			}
 		}()
@@ -254,7 +268,6 @@ var ConnectCmd = &cobra.Command{
 				if knownPeers[peerAddrStr] {
 					continue
 				}
-				knownPeers[peerAddrStr] = true
 				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 				if err != nil {
 					continue
@@ -262,7 +275,12 @@ var ConnectCmd = &cobra.Command{
 				if !network.IsValidPeerAddr(peerAddr) {
 					continue // reject broadcast/multicast/unspecified IPs and privileged ports
 				}
-				go peerConn.PunchHole(peerAddr)
+				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+				if err != nil || len(pub) != 32 {
+					continue // no valid pubkey from the rendezvous → cannot handshake
+				}
+				knownPeers[peerAddrStr] = true
+				peerConn.AddKnownPeer(peerAddr, pub)
 			}
 		}()
 

@@ -17,9 +17,10 @@ import (
 type PeerAddr struct {
 	Public string
 	Local  string
+	PubKey string // base64-encoded Noise static public key, distributed by the rendezvous
 }
 
-func Register(hostname, sessionId, password, udpAddr string, create bool) ([]PeerAddr, error) {
+func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
 	if hostname != "" && hostname[len(hostname)-1] == '/' {
 		hostname = hostname[:len(hostname)-1]
 	}
@@ -60,6 +61,7 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) ([]Pee
 	body := map[string]string{
 		"udp_addr":   udpAddr,
 		"local_addr": localAddr,
+		"pub_key":    pubKey,
 	}
 	if password != "" {
 		body["password"] = password
@@ -79,11 +81,12 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) ([]Pee
 	}
 	defer resp.Body.Close()
 
-	// server returns {"peers": [{"ip": "...", "local_addr": "..."}]}
+	// server returns {"peers": [{"ip": "...", "local_addr": "...", "pub_key": "..."}]}
 	var respBody struct {
 		Peers []struct {
 			IP        string `json:"ip"`
 			LocalAddr string `json:"local_addr"`
+			PubKey    string `json:"pub_key"`
 		} `json:"peers"`
 		Error string `json:"error"`
 	}
@@ -97,6 +100,7 @@ func Register(hostname, sessionId, password, udpAddr string, create bool) ([]Pee
 		peers[i] = PeerAddr{
 			Public: p.IP,
 			Local:  p.LocalAddr,
+			PubKey: p.PubKey,
 		}
 	}
 	return peers, nil
@@ -189,12 +193,13 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 				var peer struct {
 					IP        string `json:"ip"`
 					LocalAddr string `json:"local_addr"`
+					PubKey    string `json:"pub_key"`
 				}
 				if err := json.Unmarshal([]byte(data), &peer); err != nil {
 					continue
 				}
 				select {
-				case ch <- PeerAddr{Public: peer.IP, Local: peer.LocalAddr}:
+				case ch <- PeerAddr{Public: peer.IP, Local: peer.LocalAddr, PubKey: peer.PubKey}:
 				case <-quit:
 					resp.Body.Close()
 					cancel()

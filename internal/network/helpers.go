@@ -12,11 +12,11 @@ var (
 	mu       sync.Mutex
 )
 
-// sends 0x02 every 10 seconds to keep the connection alive
+// sends a versioned ping every 10 seconds to keep the connection alive
 func KeepAlive(conn *net.UDPConn, peerAddr *net.UDPAddr) {
 	for {
 		time.Sleep(10 * time.Second)
-		conn.WriteToUDP([]byte{PacketPing}, peerAddr)
+		conn.WriteToUDP(buildPacket(PacketPing, nil), peerAddr)
 	}
 }
 
@@ -44,13 +44,10 @@ func UpdateLastSeen() {
 }
 
 func KeepAliveAll(p *PeerConn) {
+	ping := buildPacket(PacketPing, nil)
 	for {
 		time.Sleep(10 * time.Second)
-		p.mu.Lock()
-		peers := make([]*net.UDPAddr, len(p.peers))
-		copy(peers, p.peers)
-		p.mu.Unlock()
-		for _, addr := range peers {
+		for _, addr := range p.establishedPeers() {
 			p.mu.Lock()
 			missed := p.missedPings[addr.String()]
 			p.mu.Unlock()
@@ -59,7 +56,7 @@ func KeepAliveAll(p *PeerConn) {
 				p.RemovePeer(addr)
 				continue
 			}
-			p.conn.WriteToUDP([]byte{PacketPing}, addr)
+			p.conn.WriteToUDP(ping, addr)
 			p.mu.Lock()
 			p.missedPings[addr.String()]++
 			p.mu.Unlock()

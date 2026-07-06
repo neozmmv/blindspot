@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -48,7 +50,12 @@ var ChatCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		peers, err := session.Register(hostname, sessionId, password, publicAddr, new)
+		// PSK second factor + Noise prologue, and our published static pubkey.
+		psk := crypto.DerivePSK(password, sessionId)
+		prologue := network.Prologue(sessionId)
+		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, new)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
 			conn.Close()
@@ -56,12 +63,12 @@ var ChatCmd = &cobra.Command{
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
+		peerConn := network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		defer func() {
 			session.Leave(hostname, sessionId, password, publicAddr)
-			peerConn.BroadcastRaw([]byte{network.PacketDead})
-			peerConn.Shutdown() // stop any in-flight PunchHole goroutines
+			peerConn.BroadcastRaw([]byte{network.ProtocolVersion, network.PacketDead})
+			peerConn.Shutdown() // stop any in-flight handshake drivers
 			conn.Close()
 		}()
 
@@ -81,9 +88,13 @@ var ChatCmd = &cobra.Command{
 			if !network.IsValidPeerAddr(peerAddr) {
 				continue // reject broadcast/multicast/unspecified IPs and privileged ports
 			}
+			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+			if err != nil || len(pub) != 32 {
+				continue // no valid pubkey from the rendezvous → cannot handshake
+			}
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
 			knownPeers[peerAddrStr] = true
-			go peerConn.PunchHole(peerAddr)
+			peerConn.AddKnownPeer(peerAddr, pub)
 		}
 
 		quit := make(chan struct{})
@@ -115,8 +126,12 @@ var ChatCmd = &cobra.Command{
 				if !network.IsValidPeerAddr(peerAddr) {
 					continue // reject broadcast/multicast/unspecified IPs and privileged ports
 				}
+				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+				if err != nil || len(pub) != 32 {
+					continue // no valid pubkey from the rendezvous → cannot handshake
+				}
 				fmt.Printf("\nNew peer discovered: %s\n> ", peerAddrStr)
-				go peerConn.PunchHole(peerAddr)
+				peerConn.AddKnownPeer(peerAddr, pub)
 			}
 		}()
 

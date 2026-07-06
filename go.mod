@@ -3,6 +3,7 @@ module github.com/neozmmv/blindspot
 go 1.25.6
 
 require (
+	github.com/flynn/noise v1.1.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/pion/dtls/v2 v2.2.7 // indirect
 	github.com/pion/logging v0.2.2 // indirect

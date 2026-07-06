@@ -27,7 +27,8 @@ func deliverAndRead(t *testing.T, payload []byte) (panicVal any) {
 	if err != nil {
 		t.Fatalf("GenerateKeyPair: %v", err)
 	}
-	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey)
+	psk := crypto.DerivePSK("hardening-pass", "hardening-session")
+	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey, psk, network.Prologue("hardening-session"))
 
 	var (
 		mu   sync.Mutex
@@ -81,15 +82,16 @@ func TestReadDoesNotPanicOnMalformedPackets(t *testing.T) {
 		payload []byte
 	}{
 		{"empty", []byte{}},
-		{"single-data-type-byte", []byte{network.PacketData}},
-		{"single-tun-type-byte", []byte{network.PacketTun}},
-		{"single-hello-type-byte", []byte{network.PacketHello}},
-		{"short-hello", []byte{network.PacketHello, 0x01, 0x02}},
-		{"hello-31-byte-key", append([]byte{network.PacketHello}, make([]byte, 31)...)},
-		{"hello-33-byte-key-too-long", append([]byte{network.PacketHello}, make([]byte, 33)...)},
-		{"data-too-short-for-nonce", []byte{network.PacketData, 0x00, 0x01}},
-		{"unknown-type", []byte{0xFF, 0xAA, 0xBB}},
-		{"tun-truncated", append([]byte{network.PacketTun}, make([]byte, 5)...)},
+		{"single-version-byte-no-type", []byte{network.ProtocolVersion}},
+		{"wrong-version", []byte{0x01, network.PacketData, 0x00}},
+		{"handshake-init-empty", []byte{network.ProtocolVersion, network.PacketHandshakeInit}},
+		{"handshake-init-garbage", append([]byte{network.ProtocolVersion, network.PacketHandshakeInit}, make([]byte, 20)...)},
+		{"handshake-resp-garbage", append([]byte{network.ProtocolVersion, network.PacketHandshakeResp}, make([]byte, 48)...)},
+		{"data-no-body", []byte{network.ProtocolVersion, network.PacketData}},
+		{"data-short-counter", []byte{network.ProtocolVersion, network.PacketData, 0x00, 0x01}},
+		{"tun-truncated", append([]byte{network.ProtocolVersion, network.PacketTun}, make([]byte, 5)...)},
+		{"punch", []byte{network.ProtocolVersion, network.PacketPunch}},
+		{"unknown-type", []byte{network.ProtocolVersion, 0xFF, 0xAA, 0xBB}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,10 +106,10 @@ func TestReadDoesNotPanicOnMalformedPackets(t *testing.T) {
 // parser never panics regardless of input.
 func FuzzReadPacket(f *testing.F) {
 	f.Add([]byte{})
-	f.Add([]byte{network.PacketHello})
-	f.Add([]byte{network.PacketData, 0x00})
-	f.Add(append([]byte{network.PacketHello}, make([]byte, 32)...))
-	f.Add([]byte{0x07, 0x45, 0x00, 0x00})
+	f.Add([]byte{network.ProtocolVersion})
+	f.Add([]byte{network.ProtocolVersion, network.PacketData, 0x00})
+	f.Add(append([]byte{network.ProtocolVersion, network.PacketHandshakeInit}, make([]byte, 48)...))
+	f.Add([]byte{network.ProtocolVersion, network.PacketTun, 0x45, 0x00, 0x00})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if pv := deliverAndRead(t, data); pv != nil {
 			t.Fatalf("Read panicked on fuzz payload %x: %v", data, pv)

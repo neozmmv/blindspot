@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
@@ -71,9 +73,17 @@ var ConnectCmd = &cobra.Command{
 		isNew, _ := cmd.Flags().GetBool("new")
 		daemon, _ := cmd.Flags().GetBool("daemon")
 		statusFile, _ := cmd.Flags().GetString("status-file")
+		insecure, _ := cmd.Flags().GetBool("insecure")
 
 		if len(password) < 8 && isNew {
 			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
+		// Resolve the rendezvous URL and refuse plaintext http:// unless --insecure.
+		hostname, err := session.NormalizeHostname(hostname, insecure)
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
@@ -186,7 +196,8 @@ var ConnectCmd = &cobra.Command{
 				session.Leave(hostname, sessionId, password, publicAddr)
 			}
 			if peerConn != nil {
-				peerConn.BroadcastRaw([]byte{network.PacketDead})
+				peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
+				peerConn.Shutdown()      // stop any in-flight handshake drivers
 			}
 			conn.Close()
 			os.Remove(pidFile)
@@ -194,7 +205,14 @@ var ConnectCmd = &cobra.Command{
 			os.Remove(peersFile())
 		}()
 
-		peers, err := session.Register(hostname, sessionId, password, publicAddr, isNew)
+		// PSK (second factor) from the password via Argon2id, salted with the session
+		// id; prologue binds the Noise handshake to protocol version + session. Our
+		// static pubkey is published to the rendezvous so peers can pin it beforehand.
+		psk := crypto.DerivePSK(password, sessionId)
+		prologue := network.Prologue(sessionId)
+		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, isNew)
 		if err != nil {
 			writeStatus("error: " + err.Error())
 			return
@@ -209,7 +227,7 @@ var ConnectCmd = &cobra.Command{
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn = network.NewPeerConn(conn, privateKey, publicKey)
+		peerConn = network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		knownPeers := make(map[string]bool)
 
@@ -222,8 +240,16 @@ var ConnectCmd = &cobra.Command{
 			if err != nil {
 				continue
 			}
+			if !network.IsValidPeerAddr(peerAddr) {
+				continue // reject broadcast/multicast/unspecified IPs and privileged ports
+			}
+			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+			if err != nil || len(pub) != 32 {
+				continue // no valid pubkey from the rendezvous → cannot handshake
+			}
 			knownPeers[peerAddrStr] = true
-			go peerConn.PunchHole(peerAddr)
+			// Register the rendezvous-pinned static key and kick off the Noise handshake.
+			peerConn.AddKnownPeer(peerAddr, pub)
 		}
 
 		// Periodically re-register to keep the rendezvous session TTL alive.
@@ -235,7 +261,7 @@ var ConnectCmd = &cobra.Command{
 				case <-quit:
 					return
 				case <-ticker.C:
-					session.Register(hostname, sessionId, password, publicAddr, false)
+					session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, false)
 				}
 			}
 		}()
@@ -250,17 +276,27 @@ var ConnectCmd = &cobra.Command{
 				if knownPeers[peerAddrStr] {
 					continue
 				}
-				knownPeers[peerAddrStr] = true
 				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 				if err != nil {
 					continue
 				}
-				go peerConn.PunchHole(peerAddr)
+				if !network.IsValidPeerAddr(peerAddr) {
+					continue // reject broadcast/multicast/unspecified IPs and privileged ports
+				}
+				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+				if err != nil || len(pub) != 32 {
+					continue // no valid pubkey from the rendezvous → cannot handshake
+				}
+				knownPeers[peerAddrStr] = true
+				peerConn.AddKnownPeer(peerAddr, pub)
 			}
 		}()
 
-		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing
+		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing.
 		var virtualIPMap sync.Map
+		// addrToVIP is the reverse map (peer UDP addr → virtual IP) used by the TUN
+		// reverse-path filter to verify the inner source IP of incoming tunnel packets.
+		var addrToVIP sync.Map
 
 		go func() {
 			for {
@@ -268,6 +304,7 @@ var ConnectCmd = &cobra.Command{
 				case <-quit:
 					return
 				case addr := <-peerConn.Dead:
+					addrToVIP.Delete(addr.String())
 					virtualIPMap.Range(func(k, v any) bool {
 						if v.(*net.UDPAddr).String() == addr.String() {
 							virtualIPMap.Delete(k)
@@ -289,6 +326,7 @@ var ConnectCmd = &cobra.Command{
 						return
 					}
 					if strings.Contains(err.Error(), "peer is dead") && addr != nil {
+						addrToVIP.Delete(addr.String())
 						virtualIPMap.Range(func(k, v any) bool {
 							if v.(*net.UDPAddr).String() == addr.String() {
 								virtualIPMap.Delete(k)
@@ -301,6 +339,13 @@ var ConnectCmd = &cobra.Command{
 					continue
 				}
 				if pktType != network.PacketTun {
+					continue
+				}
+				// Reverse-path filter: the inner IPv4 source address must equal the
+				// sender's virtual IP. Otherwise a malicious member could inject packets
+				// spoofing another peer's virtual IP inside the (authenticated) tunnel.
+				expectedVIP, ok := addrToVIP.Load(addr.String())
+				if !ok || !bstun.SrcIPMatchesVirtualIP(plaintext, expectedVIP.(string)) {
 					continue
 				}
 				network.UpdateLastSeen()
@@ -368,7 +413,9 @@ var ConnectCmd = &cobra.Command{
 			for addr := range peerConn.Connected {
 				network.UpdateLastSeen()
 				if pubKey, ok := peerConn.PeerPublicKey(addr); ok {
-					virtualIPMap.Store(bstun.VirtualIPv4(pubKey), addr)
+					vip := bstun.VirtualIPv4(pubKey)
+					virtualIPMap.Store(vip, addr)
+					addrToVIP.Store(addr.String(), vip)
 					writePeers(&virtualIPMap)
 				}
 				if first {
@@ -387,6 +434,7 @@ func init() {
 	ConnectCmd.Flags().StringP("session", "s", "", "Session ID")
 	ConnectCmd.Flags().StringP("password", "p", "", "Session password")
 	ConnectCmd.Flags().BoolP("new", "n", false, "Create new session with password")
+	ConnectCmd.Flags().Bool("insecure", false, "Allow a plaintext http:// rendezvous (NOT recommended)")
 	ConnectCmd.MarkFlagRequired("session")
 	ConnectCmd.Flags().Bool("daemon", false, "")
 	ConnectCmd.Flags().String("status-file", "", "")

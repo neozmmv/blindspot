@@ -26,6 +26,7 @@ func init() {
 	rootCmd.AddCommand(IPCmd)
 	rootCmd.AddCommand(SendCmd)
 	rootCmd.AddCommand(ReceiveCmd)
+	rootCmd.AddCommand(IdentityCmd)
 	rootCmd.AddCommand(VersionCmd)
 }
 

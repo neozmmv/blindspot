@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -16,10 +17,12 @@ import (
 	"github.com/neozmmv/blindspot/internal/session"
 )
 
-// rvPeer mirrors the JSON shape the real rendezvous server sends.
+// rvPeer mirrors the JSON shape the real rendezvous server sends, including the
+// static public key it now distributes alongside each address.
 type rvPeer struct {
 	IP        string `json:"ip"`
 	LocalAddr string `json:"local_addr"`
+	PubKey    string `json:"pub_key"`
 }
 
 type rvSession struct {
@@ -48,10 +51,14 @@ func (s *rvSession) addPeer(p rvPeer) []rvPeer {
 	return existing
 }
 
-// addStream registers an SSE listener and returns a cleanup function.
+// addStream registers an SSE listener and returns a cleanup function. Like the
+// real server, it first replays the peers already present in the session.
 func (s *rvSession) addStream() (chan rvPeer, func()) {
-	ch := make(chan rvPeer, 16)
+	ch := make(chan rvPeer, len(s.peers)+16)
 	s.mu.Lock()
+	for _, p := range s.peers {
+		ch <- p
+	}
 	s.streams = append(s.streams, ch)
 	s.mu.Unlock()
 	return ch, func() {
@@ -68,7 +75,8 @@ func (s *rvSession) addStream() (chan rvPeer, func()) {
 }
 
 // mockRendezvous implements a minimal rendezvous server for testing.
-// It handles both the password-less (/session/) and password (/join_session/) variants.
+// It handles both the password-less (/session/) and password (/join_session/) variants
+// and carries the pub_key field through registration, POST responses, and SSE.
 type mockRendezvous struct {
 	mu       sync.Mutex
 	sessions map[string]*rvSession
@@ -129,10 +137,11 @@ func (m *mockRendezvous) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			UDPAddr   string `json:"udp_addr"`
 			LocalAddr string `json:"local_addr"`
+			PubKey    string `json:"pub_key"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		s := m.getOrCreate(sessionID)
-		existing := s.addPeer(rvPeer{IP: body.UDPAddr, LocalAddr: body.LocalAddr})
+		existing := s.addPeer(rvPeer{IP: body.UDPAddr, LocalAddr: body.LocalAddr, PubKey: body.PubKey})
 		json.NewEncoder(w).Encode(map[string]any{"peers": existing})
 	}
 }
@@ -168,37 +177,74 @@ func (m *mockRendezvous) handleStream(w http.ResponseWriter, r *http.Request, se
 	}
 }
 
-// testPeer wraps a local UDP socket + PeerConn for use in tests.
-type testPeer struct {
-	conn *net.UDPConn
-	addr string
-	pc   *network.PeerConn
+// recvMsg is a decrypted transport message surfaced by a test peer's read loop.
+type recvMsg struct {
+	typ  byte
+	data []byte
+	addr *net.UDPAddr
 }
 
-func newTestPeer(t *testing.T) *testPeer {
+// testPeer wraps a local UDP socket + PeerConn for use in tests.
+type testPeer struct {
+	conn   *net.UDPConn
+	addr   string
+	kp     *crypto.KeyPair
+	pubB64 string
+	pc     *network.PeerConn
+	recv   chan recvMsg
+}
+
+// newTestPeer builds a peer whose PeerConn is configured exactly like the client:
+// static keypair + Argon2id PSK (from password + sessionId) + version/session prologue.
+func newTestPeer(t *testing.T, sessionID, password string) *testPeer {
+	t.Helper()
+	return newTestPeerWithKey(t, sessionID, password, mustKeyPair(t))
+}
+
+func newTestPeerWithKey(t *testing.T, sessionID, password string, kp *crypto.KeyPair) *testPeer {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP: %v", err)
 	}
+	addr := fmt.Sprintf("127.0.0.1:%d", conn.LocalAddr().(*net.UDPAddr).Port)
+	psk := crypto.DerivePSK(password, sessionID)
+	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey, psk, network.Prologue(sessionID))
+	return &testPeer{
+		conn:   conn,
+		addr:   addr,
+		kp:     kp,
+		pubB64: base64.StdEncoding.EncodeToString(kp.PublicKey),
+		pc:     pc,
+		recv:   make(chan recvMsg, 16),
+	}
+}
+
+func mustKeyPair(t *testing.T) *crypto.KeyPair {
+	t.Helper()
 	kp, err := crypto.GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("GenerateKeyPair: %v", err)
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", conn.LocalAddr().(*net.UDPAddr).Port)
-	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey)
-	return &testPeer{conn: conn, addr: addr, pc: pc}
+	return kp
 }
 
-// startReadLoop drives the PeerConn event loop in a background goroutine.
-// Handshake (PacketHello) and keepalive (PacketPing/Pong) are handled internally
-// by PeerConn.Read, so this loop is what makes peer connections actually complete.
+// startReadLoop drives the PeerConn event loop. Handshake, punch, and keepalive
+// packets are handled internally by PeerConn.Read; decrypted data/tun messages are
+// forwarded to the recv channel.
 func (tp *testPeer) startReadLoop() {
 	go func() {
 		for {
-			_, _, _, err := tp.pc.Read()
-			if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-				return
+			typ, data, addr, err := tp.pc.Read()
+			if err != nil {
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					return
+				}
+				continue
+			}
+			select {
+			case tp.recv <- recvMsg{typ: typ, data: data, addr: addr}:
+			default:
 			}
 		}
 	}()
@@ -215,15 +261,37 @@ func (tp *testPeer) waitConnected(t *testing.T, timeout time.Duration) *net.UDPA
 	}
 }
 
-// runConnectionTest is the shared body for both -s and -s -p scenarios.
-//
-// Flow:
-//  1. Peer A registers (creates the session when a password is provided).
-//  2. Peer B registers and receives Peer A's address in the response.
-//  3. Peer B initiates a UDP hole-punch towards Peer A.
-//  4. Peer A's Read loop receives the Hello, responds, and fires Connected.
-//  5. Peer B's Read loop receives the echo Hello and fires Connected.
-//  6. Both Connected events must arrive within 3 seconds.
+// notConnected asserts the peer does NOT complete a handshake within the window.
+func (tp *testPeer) notConnected(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case addr := <-tp.pc.Connected:
+		t.Fatalf("expected no connection, but handshake completed with %v", addr)
+	case <-time.After(timeout):
+	}
+}
+
+func mustResolve(t *testing.T, addr string) *net.UDPAddr {
+	t.Helper()
+	a, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%s): %v", addr, err)
+	}
+	return a
+}
+
+func mustDecodeKey(t *testing.T, b64 string) []byte {
+	t.Helper()
+	k, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("decode pubkey: %v", err)
+	}
+	return k
+}
+
+// runConnectionTest exercises the full Noise IKpsk2 flow for both -s and -s -p
+// scenarios: register through the (mock) rendezvous, learn each other's pinned
+// static key, complete the handshake, and round-trip an encrypted message.
 func runConnectionTest(t *testing.T, sessionID, password string) {
 	t.Helper()
 
@@ -231,46 +299,60 @@ func runConnectionTest(t *testing.T, sessionID, password string) {
 	srv := httptest.NewServer(rv)
 	defer srv.Close()
 
-	peerA := newTestPeer(t)
+	peerA := newTestPeer(t, sessionID, password)
 	defer peerA.conn.Close()
+	defer peerA.pc.Shutdown()
 
-	peerB := newTestPeer(t)
+	peerB := newTestPeer(t, sessionID, password)
 	defer peerB.conn.Close()
+	defer peerB.pc.Shutdown()
 
 	peerA.startReadLoop()
 	peerB.startReadLoop()
 
-	// Peer A registers first. When a password is provided it also creates the session.
-	_, err := session.Register(srv.URL, sessionID, password, peerA.addr, password != "")
-	if err != nil {
+	// Peer A registers first (creating the session when a password is provided).
+	if _, err := session.Register(srv.URL, sessionID, password, peerA.addr, peerA.pubB64, password != ""); err != nil {
 		t.Fatalf("peer A register: %v", err)
 	}
 
-	// Peer B registers and should receive Peer A's address in the response.
-	peersForB, err := session.Register(srv.URL, sessionID, password, peerB.addr, false)
+	// Peer B registers and receives Peer A's address AND pinned pubkey.
+	peersForB, err := session.Register(srv.URL, sessionID, password, peerB.addr, peerB.pubB64, false)
 	if err != nil {
 		t.Fatalf("peer B register: %v", err)
 	}
 	if len(peersForB) != 1 {
 		t.Fatalf("peer B expected 1 peer, got %d", len(peersForB))
 	}
-	if peersForB[0].Public != peerA.addr {
-		t.Fatalf("peer B expected peer A at %s, got %s", peerA.addr, peersForB[0].Public)
+	if peersForB[0].PubKey != peerA.pubB64 {
+		t.Fatalf("peer B expected peer A pubkey %s, got %s", peerA.pubB64, peersForB[0].PubKey)
 	}
 
-	t.Logf("peer A addr: %s", peerA.addr)
-	t.Logf("peer B addr: %s", peerB.addr)
+	// Each side registers the other's rendezvous-pinned static and starts the handshake.
+	peerB.pc.AddKnownPeer(mustResolve(t, peerA.addr), mustDecodeKey(t, peerA.pubB64))
+	peerA.pc.AddKnownPeer(mustResolve(t, peerB.addr), mustDecodeKey(t, peerB.pubB64))
 
-	// Peer B punches towards Peer A. Peer A's Read loop auto-responds with its own
-	// Hello, which causes Peer B's Read loop to complete the handshake on both sides.
-	peerAUDP, _ := net.ResolveUDPAddr("udp", peersForB[0].Public)
-	go peerB.pc.PunchHole(peerAUDP)
+	connectedOnA := peerA.waitConnected(t, 5*time.Second)
+	connectedOnB := peerB.waitConnected(t, 5*time.Second)
 
-	connectedOnA := peerA.waitConnected(t, 3*time.Second)
-	connectedOnB := peerB.waitConnected(t, 3*time.Second)
+	// The authenticated key each side sees must be the other's real static key.
+	if gotB, ok := peerA.pc.PeerPublicKey(connectedOnA); !ok || !strings.EqualFold(base64.StdEncoding.EncodeToString(gotB), peerB.pubB64) {
+		t.Fatalf("peer A did not authenticate peer B's static key")
+	}
 
-	t.Logf("peer A sees peer at: %s", connectedOnA)
-	t.Logf("peer B sees peer at: %s", connectedOnB)
+	// Encrypted round-trip A → B over the established Noise session.
+	msg := []byte("hello from A")
+	if err := peerA.pc.Send(connectedOnA, msg); err != nil {
+		t.Fatalf("peer A send: %v", err)
+	}
+	select {
+	case got := <-peerB.recv:
+		if string(got.data) != string(msg) {
+			t.Fatalf("peer B received %q, want %q", got.data, msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer B did not receive the message")
+	}
+	_ = connectedOnB
 }
 
 // TestConnectionNoPassword simulates `blindspot connect -s <session>` with two peers.

@@ -126,7 +126,31 @@ sudo blindspot connect -s my-network -p mypassword -n
 -p, --password   Session password (required, min 8 chars when creating)
 -n, --new        Create a new password-protected session
 -H, --hostname   Custom rendezvous server
+    --insecure   Allow a plaintext http:// rendezvous (NOT recommended)
 ```
+
+The rendezvous must be reached over `https://` — a plaintext `http://` URL is refused
+unless you explicitly pass `--insecure`. The session password is sent to the rendezvous
+in the request body / `Authorization` header, never in the URL query string.
+
+---
+
+### Encrypting your identity at rest — `identity`
+
+Your private key lives at `~/.blindspot/identity.json`. To encrypt it at rest, set a
+passphrase in the `BLINDSPOT_IDENTITY_PASSPHRASE` environment variable; new identities
+are then stored encrypted (scrypt + AES-256-GCM), and reading the private key requires
+the passphrase.
+
+```
+blindspot identity status     # show whether the identity is encrypted
+blindspot identity encrypt     # encrypt using BLINDSPOT_IDENTITY_PASSPHRASE
+blindspot identity decrypt     # revert to plaintext (needs the passphrase)
+```
+
+> Note: the `connect` daemon relaunches elevated via UAC, which does not inherit a
+> shell-session environment variable — set `BLINDSPOT_IDENTITY_PASSPHRASE` as a
+> persistent user/machine variable (e.g. `setx`) for the elevated daemon to see it.
 
 ---
 

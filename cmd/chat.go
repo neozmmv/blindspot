@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/session"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -23,9 +25,17 @@ var ChatCmd = &cobra.Command{
 		sessionId, _ := cmd.Flags().GetString("session")
 		password, _ := cmd.Flags().GetString("password")
 		new, _ := cmd.Flags().GetBool("new")
+		insecure, _ := cmd.Flags().GetBool("insecure")
 
 		if len(password) < 8 && new {
 			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
+		// Resolve the rendezvous URL and refuse plaintext http:// unless --insecure.
+		hostname, err := session.NormalizeHostname(hostname, insecure)
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
@@ -48,7 +58,12 @@ var ChatCmd = &cobra.Command{
 
 		fmt.Println("Public addr:", publicAddr)
 
-		peers, err := session.Register(hostname, sessionId, password, publicAddr, new)
+		// PSK second factor + Noise prologue, and our published static pubkey.
+		psk := crypto.DerivePSK(password, sessionId)
+		prologue := network.Prologue(sessionId)
+		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+
+		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, new)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
 			conn.Close()
@@ -56,11 +71,12 @@ var ChatCmd = &cobra.Command{
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn := network.NewPeerConn(conn, privateKey, publicKey)
+		peerConn := network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		defer func() {
 			session.Leave(hostname, sessionId, password, publicAddr)
-			peerConn.BroadcastRaw([]byte{network.PacketDead})
+			peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
+			peerConn.Shutdown()      // stop any in-flight handshake drivers
 			conn.Close()
 		}()
 
@@ -77,9 +93,16 @@ var ChatCmd = &cobra.Command{
 				fmt.Printf("Error resolving peer address: %v\n", err)
 				continue
 			}
+			if !network.IsValidPeerAddr(peerAddr) {
+				continue // reject broadcast/multicast/unspecified IPs and privileged ports
+			}
+			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+			if err != nil || len(pub) != 32 {
+				continue // no valid pubkey from the rendezvous → cannot handshake
+			}
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
 			knownPeers[peerAddrStr] = true
-			go peerConn.PunchHole(peerAddr)
+			peerConn.AddKnownPeer(peerAddr, pub)
 		}
 
 		quit := make(chan struct{})
@@ -108,8 +131,15 @@ var ChatCmd = &cobra.Command{
 				if err != nil {
 					continue
 				}
+				if !network.IsValidPeerAddr(peerAddr) {
+					continue // reject broadcast/multicast/unspecified IPs and privileged ports
+				}
+				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
+				if err != nil || len(pub) != 32 {
+					continue // no valid pubkey from the rendezvous → cannot handshake
+				}
 				fmt.Printf("\nNew peer discovered: %s\n> ", peerAddrStr)
-				go peerConn.PunchHole(peerAddr)
+				peerConn.AddKnownPeer(peerAddr, pub)
 			}
 		}()
 
@@ -208,5 +238,6 @@ func init() {
 	ChatCmd.Flags().StringP("session", "s", "", "Session ID")
 	ChatCmd.Flags().StringP("password", "p", "", "Session password")
 	ChatCmd.Flags().BoolP("new", "n", false, "Create new session with password")
+	ChatCmd.Flags().Bool("insecure", false, "Allow a plaintext http:// rendezvous (NOT recommended)")
 	ChatCmd.MarkFlagRequired("session")
 }

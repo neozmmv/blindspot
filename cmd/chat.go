@@ -61,6 +61,7 @@ var ChatCmd = &cobra.Command{
 		defer func() {
 			session.Leave(hostname, sessionId, password, publicAddr)
 			peerConn.BroadcastRaw([]byte{network.PacketDead})
+			peerConn.Shutdown() // stop any in-flight PunchHole goroutines
 			conn.Close()
 		}()
 
@@ -76,6 +77,9 @@ var ChatCmd = &cobra.Command{
 			if err != nil {
 				fmt.Printf("Error resolving peer address: %v\n", err)
 				continue
+			}
+			if !network.IsValidPeerAddr(peerAddr) {
+				continue // reject broadcast/multicast/unspecified IPs and privileged ports
 			}
 			fmt.Printf("Peer addr: %s\n", peerAddrStr)
 			knownPeers[peerAddrStr] = true
@@ -107,6 +111,9 @@ var ChatCmd = &cobra.Command{
 				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 				if err != nil {
 					continue
+				}
+				if !network.IsValidPeerAddr(peerAddr) {
+					continue // reject broadcast/multicast/unspecified IPs and privileged ports
 				}
 				fmt.Printf("\nNew peer discovered: %s\n> ", peerAddrStr)
 				go peerConn.PunchHole(peerAddr)

@@ -187,6 +187,7 @@ var ConnectCmd = &cobra.Command{
 			}
 			if peerConn != nil {
 				peerConn.BroadcastRaw([]byte{network.PacketDead})
+				peerConn.Shutdown() // stop any in-flight PunchHole goroutines
 			}
 			conn.Close()
 			os.Remove(pidFile)
@@ -222,6 +223,9 @@ var ConnectCmd = &cobra.Command{
 			if err != nil {
 				continue
 			}
+			if !network.IsValidPeerAddr(peerAddr) {
+				continue // reject broadcast/multicast/unspecified IPs and privileged ports
+			}
 			knownPeers[peerAddrStr] = true
 			go peerConn.PunchHole(peerAddr)
 		}
@@ -254,6 +258,9 @@ var ConnectCmd = &cobra.Command{
 				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 				if err != nil {
 					continue
+				}
+				if !network.IsValidPeerAddr(peerAddr) {
+					continue // reject broadcast/multicast/unspecified IPs and privileged ports
 				}
 				go peerConn.PunchHole(peerAddr)
 			}

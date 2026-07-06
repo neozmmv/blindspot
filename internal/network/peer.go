@@ -20,6 +20,8 @@ type PeerConn struct {
 	mu             sync.Mutex
 	Connected      chan *net.UDPAddr // signals when a new peer connects
 	Dead           chan *net.UDPAddr // signals when a peer is declared dead
+	stop           chan struct{}     // closed by Shutdown to stop background loops (e.g. PunchHole)
+	stopOnce       sync.Once
 }
 
 func NewPeerConn(conn *net.UDPConn, privateKey, publicKey []byte) *PeerConn {
@@ -32,17 +34,31 @@ func NewPeerConn(conn *net.UDPConn, privateKey, publicKey []byte) *PeerConn {
 		missedPings:    map[string]int{},
 		Connected:      make(chan *net.UDPAddr, 10),
 		Dead:           make(chan *net.UDPAddr, 10),
+		stop:           make(chan struct{}),
 	}
 }
 
+// Shutdown signals background loops (such as PunchHole) to stop. It is safe to
+// call multiple times and does not close the underlying UDP connection.
+func (p *PeerConn) Shutdown() {
+	p.stopOnce.Do(func() { close(p.stop) })
+}
+
 func (p *PeerConn) AddPeer(addr *net.UDPAddr, peerPublicKey []byte) error {
-	sharedKey, err := crypto.DeriveSharedKey(p.privateKey, peerPublicKey)
+	if len(peerPublicKey) != 32 {
+		return fmt.Errorf("invalid peer public key length: %d", len(peerPublicKey))
+	}
+	// Copy the key before storing it: the caller's slice may alias a reused read
+	// buffer that the next ReadFromUDP will overwrite, corrupting the stored key.
+	keyCopy := make([]byte, len(peerPublicKey))
+	copy(keyCopy, peerPublicKey)
+	sharedKey, err := crypto.DeriveSharedKey(p.privateKey, keyCopy)
 	if err != nil {
 		return err
 	}
 	p.mu.Lock()
 	p.sharedKeys[addr.String()] = sharedKey
-	p.peerPublicKeys[addr.String()] = peerPublicKey
+	p.peerPublicKeys[addr.String()] = keyCopy
 	p.peers = append(p.peers, addr)
 	p.mu.Unlock()
 	p.Connected <- addr
@@ -84,15 +100,30 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 		if err != nil {
 			return 0, nil, nil, fmt.Errorf("error reading from peer: %w", err)
 		}
+		// Guard against empty datagrams before indexing buf[0]. A zero-length UDP
+		// packet is legal; without this, buf[0] reads stale data and buf[1:n] with
+		// n==0 (buf[1:0]) panics with a slice-bounds-out-of-range.
+		if n < 1 {
+			continue
+		}
 		switch buf[0] {
 		case PacketHello:
+			// A HELLO is exactly 1 type byte + 32-byte public key. Reject any other
+			// length instead of slicing with an attacker-controlled n.
+			if n != 33 {
+				continue
+			}
 			peerPublicKey := buf[1:n]
 			p.mu.Lock()
 			_, alreadyConnected := p.sharedKeys[addr.String()]
 			p.mu.Unlock()
 			if !alreadyConnected {
 				p.conn.WriteToUDP(append([]byte{PacketHello}, p.publicKey...), addr)
-				p.AddPeer(addr, peerPublicKey)
+				// AddPeer copies the key internally; check its error so a bad key
+				// doesn't silently start a punch loop against a half-open peer.
+				if err := p.AddPeer(addr, peerPublicKey); err != nil {
+					continue
+				}
 				go p.PunchHole(addr)
 			}
 			continue
@@ -145,19 +176,33 @@ func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
 	}
 }
 
+const (
+	punchInterval     = 100 * time.Millisecond
+	punchMaxAttempts  = 200              // upper bound on packets sent per peer
+	punchTotalTimeout = 20 * time.Second // give up hole-punching after this window
+)
+
 func (p *PeerConn) PunchHole(peerAddr *net.UDPAddr) {
 	packet := make([]byte, 1+len(p.publicKey))
 	packet[0] = PacketHello
 	copy(packet[1:], p.publicKey)
-	for {
+	deadline := time.Now().Add(punchTotalTimeout)
+	// Bounded loop: stop once connected, after a fixed number of attempts, past the
+	// total deadline, or when Shutdown is called. This prevents a leaked goroutine
+	// that punches forever at a peer that never answers.
+	for range punchMaxAttempts {
 		p.mu.Lock()
 		_, connected := p.sharedKeys[peerAddr.String()]
 		p.mu.Unlock()
-		if connected {
+		if connected || time.Now().After(deadline) {
 			return
 		}
 		p.conn.WriteToUDP(packet, peerAddr)
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-p.stop:
+			return
+		case <-time.After(punchInterval):
+		}
 	}
 }
 

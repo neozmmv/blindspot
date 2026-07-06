@@ -37,6 +37,44 @@ type peerSession struct {
 	established  bool
 	initMsg      []byte // initiator: cached msg1 packet, retransmitted until established
 	respMsg      []byte // responder: cached msg2 packet, retransmitted on duplicate msg1
+
+	// Anti-replay window for the receive direction (WireGuard/IPsec style).
+	// replayMax is the highest counter accepted so far; replayBits is a bitmap of
+	// the replayWindow counters ending at replayMax (bit i ⇒ counter replayMax-i seen).
+	replayMax  uint64
+	replayBits uint64
+}
+
+// replayWindow is the width of the anti-replay sliding window, in packets.
+const replayWindow = 64
+
+// checkReplayLocked reports whether counter is fresh (neither already seen nor
+// older than the window) and records it. It must be called with s.mu held, only
+// after the packet has been successfully authenticated, so that a forged packet
+// can never advance or poke holes in the window.
+func (s *peerSession) checkReplayLocked(counter uint64) bool {
+	if counter > s.replayMax {
+		shift := counter - s.replayMax
+		if shift >= replayWindow {
+			s.replayBits = 0
+		} else {
+			s.replayBits <<= shift
+		}
+		s.replayBits |= 1 // bit 0 marks the new replayMax
+		s.replayMax = counter
+		return true
+	}
+	// counter <= replayMax: it must fall within the window and not be seen yet.
+	diff := s.replayMax - counter
+	if diff >= replayWindow {
+		return false // too old
+	}
+	mask := uint64(1) << diff
+	if s.replayBits&mask != 0 {
+		return false // replay
+	}
+	s.replayBits |= mask
+	return true
 }
 
 type PeerConn struct {
@@ -209,21 +247,27 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 		case PacketHandshakeResp:
 			p.handleHandshakeResp(addr, body)
 			continue
-		case PacketPing:
-			UpdateLastSeen()
-			p.conn.WriteToUDP(buildPacket(PacketPong, nil), addr)
+		case PacketControl:
+			plaintext, err := p.openTransport(addr, buf[:n])
+			if err != nil || len(plaintext) < 1 {
+				continue
+			}
+			switch plaintext[0] {
+			case CtrlPing:
+				UpdateLastSeen()
+				p.sendControl(addr, CtrlPong)
+			case CtrlPong:
+				UpdateLastSeen()
+				p.mu.Lock()
+				p.missedPings[addr.String()] = 0
+				p.mu.Unlock()
+			case CtrlDead:
+				p.dropSession(addr)
+				return PacketControl, nil, addr, fmt.Errorf("peer is dead")
+			}
 			continue
-		case PacketPong:
-			UpdateLastSeen()
-			p.mu.Lock()
-			p.missedPings[addr.String()] = 0
-			p.mu.Unlock()
-			continue
-		case PacketDead:
-			p.dropSession(addr)
-			return PacketDead, nil, addr, fmt.Errorf("peer is dead")
 		case PacketData, PacketTun:
-			plaintext, err := p.decrypt(addr, body)
+			plaintext, err := p.openTransport(addr, buf[:n])
 			if err != nil {
 				continue
 			}
@@ -340,8 +384,21 @@ func (p *PeerConn) handleHandshakeResp(addr *net.UDPAddr, msg2 []byte) {
 	p.fireConnected(addr)
 }
 
-// decrypt authenticates and decrypts a transport packet body ([counter][ct]).
-func (p *PeerConn) decrypt(addr *net.UDPAddr, body []byte) ([]byte, error) {
+// transportHeaderLen is the cleartext prefix [version][type][counter] that also
+// serves as the AEAD additional data.
+const transportHeaderLen = 2 + counterLen
+
+// openTransport authenticates and decrypts a transport packet
+// [version][type][counter][ct], enforcing the anti-replay window. The 10-byte
+// header is used as AAD, so the type and counter are authenticated.
+func (p *PeerConn) openTransport(addr *net.UDPAddr, pkt []byte) ([]byte, error) {
+	if len(pkt) < transportHeaderLen {
+		return nil, fmt.Errorf("transport packet too short")
+	}
+	header := pkt[:transportHeaderLen]
+	counter := binary.BigEndian.Uint64(pkt[2:transportHeaderLen])
+	ct := pkt[transportHeaderLen:]
+
 	p.mu.Lock()
 	s, ok := p.sessions[addr.String()]
 	p.mu.Unlock()
@@ -353,15 +410,18 @@ func (p *PeerConn) decrypt(addr *net.UDPAddr, body []byte) ([]byte, error) {
 	if !s.established || s.rx == nil {
 		return nil, fmt.Errorf("peer %s not established", addr)
 	}
-	if len(body) < counterLen {
-		return nil, fmt.Errorf("transport packet too short")
-	}
-	counter := binary.BigEndian.Uint64(body[:counterLen])
 	// The counter is the AEAD nonce; using it directly lets us decrypt out of order.
-	// Tampering with the counter changes the nonce and fails the tag, so it is
-	// implicitly authenticated. (The sliding-window replay check is added later.)
 	s.rx.SetNonce(counter)
-	return s.rx.Decrypt(nil, nil, body[counterLen:])
+	plaintext, err := s.rx.Decrypt(nil, header, ct)
+	if err != nil {
+		return nil, err
+	}
+	// Only after authentication do we consult the replay window, so a forged packet
+	// can never advance it or punch a hole in it.
+	if !s.checkReplayLocked(counter) {
+		return nil, fmt.Errorf("replayed or out-of-window packet from %s", addr)
+	}
+	return plaintext, nil
 }
 
 func (p *PeerConn) send(addr *net.UDPAddr, data []byte, pktType byte) error {
@@ -371,24 +431,32 @@ func (p *PeerConn) send(addr *net.UDPAddr, data []byte, pktType byte) error {
 	if !ok {
 		return fmt.Errorf("unknown peer: %s", addr)
 	}
+	header := make([]byte, transportHeaderLen)
+	header[0] = ProtocolVersion
+	header[1] = pktType
+
 	s.mu.Lock()
 	if !s.established || s.tx == nil {
 		s.mu.Unlock()
 		return fmt.Errorf("peer %s not established", addr)
 	}
 	counter := s.tx.Nonce()
-	ct, err := s.tx.Encrypt(nil, nil, data)
+	binary.BigEndian.PutUint64(header[2:], counter)
+	// AAD is the cleartext header (version, type, counter). Append the ciphertext
+	// after the header in a single buffer so the returned slice is the whole packet.
+	pkt, err := s.tx.Encrypt(header, header, data)
 	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	pkt := make([]byte, 2+counterLen+len(ct))
-	pkt[0] = ProtocolVersion
-	pkt[1] = pktType
-	binary.BigEndian.PutUint64(pkt[2:], counter)
-	copy(pkt[2+counterLen:], ct)
 	_, err = p.conn.WriteToUDP(pkt, addr)
 	return err
+}
+
+// sendControl sends an encrypted control message (ping/pong/dead) over the same
+// authenticated, anti-replay-protected transport as data.
+func (p *PeerConn) sendControl(addr *net.UDPAddr, opcode byte) error {
+	return p.send(addr, []byte{opcode}, PacketControl)
 }
 
 func (p *PeerConn) Send(addr *net.UDPAddr, data []byte) error {
@@ -473,10 +541,11 @@ func (p *PeerConn) Broadcast(data []byte) {
 	}
 }
 
-// BroadcastRaw sends already-framed bytes to every established peer without
-// encrypting. Used for the cleartext PacketDead shutdown notice.
-func (p *PeerConn) BroadcastRaw(data []byte) {
+// BroadcastDead sends an encrypted, authenticated "peer is dead" control message
+// to every established peer. Used on shutdown so peers tear down promptly; because
+// it rides the encrypted channel, an attacker cannot forge it to disconnect a peer.
+func (p *PeerConn) BroadcastDead() {
 	for _, addr := range p.establishedPeers() {
-		p.conn.WriteToUDP(data, addr)
+		p.sendControl(addr, CtrlDead)
 	}
 }

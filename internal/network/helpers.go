@@ -12,14 +12,6 @@ var (
 	mu       sync.Mutex
 )
 
-// sends a versioned ping every 10 seconds to keep the connection alive
-func KeepAlive(conn *net.UDPConn, peerAddr *net.UDPAddr) {
-	for {
-		time.Sleep(10 * time.Second)
-		conn.WriteToUDP(buildPacket(PacketPing, nil), peerAddr)
-	}
-}
-
 // WatchConnection monitors for activity. hasPeers returns true when there are
 // currently connected peers — the timeout only fires when peers exist but are silent.
 func WatchConnection(conn *net.UDPConn, hasPeers func() bool) error {
@@ -44,7 +36,6 @@ func UpdateLastSeen() {
 }
 
 func KeepAliveAll(p *PeerConn) {
-	ping := buildPacket(PacketPing, nil)
 	for {
 		time.Sleep(10 * time.Second)
 		for _, addr := range p.establishedPeers() {
@@ -56,7 +47,8 @@ func KeepAliveAll(p *PeerConn) {
 				p.RemovePeer(addr)
 				continue
 			}
-			p.conn.WriteToUDP(ping, addr)
+			// Encrypted, authenticated keepalive; the reply resets missedPings.
+			p.sendControl(addr, CtrlPing)
 			p.mu.Lock()
 			p.missedPings[addr.String()]++
 			p.mu.Unlock()

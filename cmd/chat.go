@@ -67,8 +67,8 @@ var ChatCmd = &cobra.Command{
 
 		defer func() {
 			session.Leave(hostname, sessionId, password, publicAddr)
-			peerConn.BroadcastRaw([]byte{network.ProtocolVersion, network.PacketDead})
-			peerConn.Shutdown() // stop any in-flight handshake drivers
+			peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
+			peerConn.Shutdown()      // stop any in-flight handshake drivers
 			conn.Close()
 		}()
 

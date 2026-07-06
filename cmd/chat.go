@@ -25,9 +25,17 @@ var ChatCmd = &cobra.Command{
 		sessionId, _ := cmd.Flags().GetString("session")
 		password, _ := cmd.Flags().GetString("password")
 		new, _ := cmd.Flags().GetBool("new")
+		insecure, _ := cmd.Flags().GetBool("insecure")
 
 		if len(password) < 8 && new {
 			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
+		// Resolve the rendezvous URL and refuse plaintext http:// unless --insecure.
+		hostname, err := session.NormalizeHostname(hostname, insecure)
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
@@ -230,5 +238,6 @@ func init() {
 	ChatCmd.Flags().StringP("session", "s", "", "Session ID")
 	ChatCmd.Flags().StringP("password", "p", "", "Session password")
 	ChatCmd.Flags().BoolP("new", "n", false, "Create new session with password")
+	ChatCmd.Flags().Bool("insecure", false, "Allow a plaintext http:// rendezvous (NOT recommended)")
 	ChatCmd.MarkFlagRequired("session")
 }

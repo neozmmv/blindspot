@@ -20,7 +20,9 @@ var ReceiveCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		here, _ := cmd.Flags().GetBool("here")
 
-		_, publicKey, err := utils.ReadIdentity()
+		// Receiving only needs the virtual IP, derived from the public key, so we
+		// read just the public key — no passphrase required even if encrypted.
+		publicKey, err := utils.ReadPublicKey()
 		if err != nil {
 			fmt.Println("No identity found. Run 'blindspot connect' first.")
 			return

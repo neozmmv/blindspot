@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -132,5 +135,65 @@ func TestStreamPeersDeliversPubKey(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive peer A over the stream")
+	}
+}
+
+func TestStreamPeersFallsBackToLegacyPasswordQuery(t *testing.T) {
+	const sessionID, password = "legacy-stream-session", "streampass1"
+
+	peerA := newTestPeer(t, sessionID, password)
+	defer peerA.conn.Close()
+
+	type seenRequest struct {
+		rawQuery string
+		auth     string
+	}
+	seen := make(chan seenRequest, 2)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/join_session/"+sessionID+"/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		seen <- seenRequest{rawQuery: r.URL.RawQuery, auth: r.Header.Get("Authorization")}
+		if r.URL.Query().Get("password") != password {
+			http.Error(w, "missing password query", http.StatusUnauthorized)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		data, _ := json.Marshal(rvPeer{IP: peerA.addr, PubKey: peerA.pubB64})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	quit := make(chan struct{})
+	defer close(quit)
+	stream := session.StreamPeers(srv.URL, sessionID, password, "127.0.0.1:1", quit)
+
+	select {
+	case p := <-stream:
+		if p.Public != peerA.addr || p.PubKey != peerA.pubB64 {
+			t.Fatalf("stream gave peer %+v, want addr %q pubkey %q", p, peerA.addr, peerA.pubB64)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not receive peer from legacy password stream")
+	}
+
+	first := <-seen
+	if first.auth != "Bearer "+password {
+		t.Fatalf("first stream request auth = %q, want bearer password", first.auth)
+	}
+	if got := first.rawQuery; got != "udp_addr=127.0.0.1%3A1" {
+		t.Fatalf("first stream query = %q, want only udp_addr", got)
+	}
+	second := <-seen
+	if got := second.rawQuery; got != "password=streampass1&udp_addr=127.0.0.1%3A1" {
+		t.Fatalf("fallback stream query = %q, want legacy password query", got)
 	}
 }

@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	// handshake retransmit cadence and overall deadline.
+	// handshake retransmit cadence.
 	handshakeInterval = 150 * time.Millisecond
-	handshakeMaxWait  = 20 * time.Second
 	// counterLen is the width of the explicit per-packet counter carried in every
 	// transport packet. The counter is used as the AEAD nonce so packets can be
 	// decrypted out of order and after loss (UDP reorders and drops freely), unlike
@@ -192,12 +191,16 @@ func (p *PeerConn) AddKnownPeer(addr *net.UDPAddr, remoteStatic []byte) error {
 	return nil
 }
 
-// driveHandshake retransmits handshake traffic until the session is established,
-// the deadline passes, or Shutdown is called. The initiator resends msg1 (which
-// doubles as a NAT hole-punch); the responder sends empty punch packets to open
-// its NAT mapping while it waits for msg1.
+// driveHandshake retransmits handshake traffic until the session is established
+// or Shutdown is called. The initiator resends msg1 (which doubles as a NAT
+// hole-punch); the responder sends empty punch packets to open its NAT mapping
+// while it waits for msg1.
+//
+// It retries for as long as the connection lives rather than giving up after a
+// fixed window: a peer that misses the initial hole-punch (transient NAT churn or
+// packet loss) must still be able to connect. The loop is bounded by p.stop, so it
+// stops promptly on shutdown and is not a goroutine leak.
 func (p *PeerConn) driveHandshake(s *peerSession) {
-	deadline := time.Now().Add(handshakeMaxWait)
 	punch := buildPacket(PacketPunch, nil)
 	for {
 		s.mu.Lock()
@@ -205,7 +208,7 @@ func (p *PeerConn) driveHandshake(s *peerSession) {
 		initiator := s.initiator
 		initMsg := s.initMsg
 		s.mu.Unlock()
-		if established || time.Now().After(deadline) {
+		if established {
 			return
 		}
 		if initiator && initMsg != nil {
@@ -489,9 +492,13 @@ func (p *PeerConn) fireConnected(addr *net.UDPAddr) {
 	p.mu.Lock()
 	p.missedPings[addr.String()] = 0
 	p.mu.Unlock()
+	// Deliver reliably: block until the consumer takes the event, or until shutdown.
+	// Dropping it would leave the peer without a virtual-IP mapping, so all of its
+	// tunnel traffic would be silently discarded for the rest of the session. This
+	// runs after s.mu is released, so blocking here cannot deadlock a session.
 	select {
 	case p.Connected <- addr:
-	default:
+	case <-p.stop:
 	}
 }
 

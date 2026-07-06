@@ -20,16 +20,39 @@ type PeerAddr struct {
 	PubKey string // base64-encoded Noise static public key, distributed by the rendezvous
 }
 
-func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
+const defaultRendezvous = "https://rendezvous.enzogp.dev"
+
+// normalizeScheme trims a trailing slash, applies the default host when empty, and
+// defaults a bare host to https://. It does NOT enforce the http:// policy — that
+// is NormalizeHostname's job so that tests/insecure callers can still pass http://.
+func normalizeScheme(hostname string) string {
+	hostname = strings.TrimSpace(hostname)
 	if hostname != "" && hostname[len(hostname)-1] == '/' {
 		hostname = hostname[:len(hostname)-1]
 	}
-	if strings.TrimSpace(hostname) == "" {
-		hostname = "https://rendezvous.enzogp.dev"
+	if hostname == "" {
+		return defaultRendezvous
 	}
 	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
 		hostname = "https://" + hostname
 	}
+	return hostname
+}
+
+// NormalizeHostname resolves the rendezvous URL and enforces transport security:
+// a plaintext http:// rendezvous is rejected unless the caller explicitly opts in
+// with insecure=true. The CLI calls this once so the password (and the Noise
+// handshake bootstrap) never travel over an unauthenticated channel by accident.
+func NormalizeHostname(hostname string, insecure bool) (string, error) {
+	hostname = normalizeScheme(hostname)
+	if strings.HasPrefix(hostname, "http://") && !insecure {
+		return "", fmt.Errorf("refusing plaintext http:// rendezvous %q; use https:// or pass --insecure", hostname)
+	}
+	return hostname, nil
+}
+
+func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
+	hostname = normalizeScheme(hostname)
 	if strings.TrimSpace(sessionId) == "" {
 		return nil, fmt.Errorf("sessionId is required")
 	}
@@ -125,19 +148,17 @@ func GetLocalAddr(remotePort int) string {
 // that emits peers as they join the session (including peers already present).
 // The stream closes when quit is closed.
 func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struct{}) <-chan PeerAddr {
-	if hostname != "" && hostname[len(hostname)-1] == '/' {
-		hostname = hostname[:len(hostname)-1]
-	}
-	if strings.TrimSpace(hostname) == "" {
-		hostname = "https://rendezvous.enzogp.dev"
-	}
-	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
-		hostname = "https://" + hostname
-	}
+	hostname = normalizeScheme(hostname)
 
-	var endpoint string
+	var endpoint, legacyEndpoint string
 	if password != "" {
-		endpoint = fmt.Sprintf("%s/join_session/%s/stream?password=%s&udp_addr=%s",
+		// The password goes in the Authorization header, never the query string:
+		// query strings leak into server access logs, proxies, and browser history.
+		endpoint = fmt.Sprintf("%s/join_session/%s/stream?udp_addr=%s",
+			hostname, sessionId, url.QueryEscape(myAddr))
+		// Compatibility for rendezvous deployments that still authenticate password
+		// streams via the legacy password query parameter.
+		legacyEndpoint = fmt.Sprintf("%s/join_session/%s/stream?password=%s&udp_addr=%s",
 			hostname, sessionId, url.QueryEscape(password), url.QueryEscape(myAddr))
 	} else {
 		endpoint = fmt.Sprintf("%s/session/%s/stream?udp_addr=%s",
@@ -148,6 +169,7 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 	go func() {
 		defer close(ch)
 
+		useLegacyQuery := false
 		for {
 			select {
 			case <-quit:
@@ -164,10 +186,17 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 				}
 			}()
 
-			req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+			streamURL := endpoint
+			if useLegacyQuery {
+				streamURL = legacyEndpoint
+			}
+			req, err := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
 			if err != nil {
 				cancel()
 				return
+			}
+			if password != "" && !useLegacyQuery {
+				req.Header.Set("Authorization", "Bearer "+password)
 			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -178,6 +207,18 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 				case <-time.After(5 * time.Second):
 					continue
 				}
+			}
+			if password != "" && !useLegacyQuery && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+				resp.Body.Close()
+				cancel()
+				useLegacyQuery = true
+				continue
+			}
+			if password != "" && !useLegacyQuery && !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+				resp.Body.Close()
+				cancel()
+				useLegacyQuery = true
+				continue
 			}
 
 			scanner := bufio.NewScanner(resp.Body)
@@ -220,15 +261,7 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 }
 
 func Leave(hostname, sessionId, password, udpAddr string) {
-	if hostname != "" && hostname[len(hostname)-1] == '/' {
-		hostname = hostname[:len(hostname)-1]
-	}
-	if strings.TrimSpace(hostname) == "" {
-		hostname = "https://rendezvous.enzogp.dev"
-	}
-	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
-		hostname = "https://" + hostname
-	}
+	hostname = normalizeScheme(hostname)
 	body := map[string]string{"udp_addr": udpAddr}
 	if password != "" {
 		body["password"] = password

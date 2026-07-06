@@ -73,9 +73,17 @@ var ConnectCmd = &cobra.Command{
 		isNew, _ := cmd.Flags().GetBool("new")
 		daemon, _ := cmd.Flags().GetBool("daemon")
 		statusFile, _ := cmd.Flags().GetString("status-file")
+		insecure, _ := cmd.Flags().GetBool("insecure")
 
 		if len(password) < 8 && isNew {
 			fmt.Println("Password must be at least 8 characters long")
+			return
+		}
+
+		// Resolve the rendezvous URL and refuse plaintext http:// unless --insecure.
+		hostname, err := session.NormalizeHostname(hostname, insecure)
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
@@ -284,8 +292,11 @@ var ConnectCmd = &cobra.Command{
 			}
 		}()
 
-		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing
+		// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing.
 		var virtualIPMap sync.Map
+		// addrToVIP is the reverse map (peer UDP addr → virtual IP) used by the TUN
+		// reverse-path filter to verify the inner source IP of incoming tunnel packets.
+		var addrToVIP sync.Map
 
 		go func() {
 			for {
@@ -293,6 +304,7 @@ var ConnectCmd = &cobra.Command{
 				case <-quit:
 					return
 				case addr := <-peerConn.Dead:
+					addrToVIP.Delete(addr.String())
 					virtualIPMap.Range(func(k, v any) bool {
 						if v.(*net.UDPAddr).String() == addr.String() {
 							virtualIPMap.Delete(k)
@@ -314,6 +326,7 @@ var ConnectCmd = &cobra.Command{
 						return
 					}
 					if strings.Contains(err.Error(), "peer is dead") && addr != nil {
+						addrToVIP.Delete(addr.String())
 						virtualIPMap.Range(func(k, v any) bool {
 							if v.(*net.UDPAddr).String() == addr.String() {
 								virtualIPMap.Delete(k)
@@ -326,6 +339,13 @@ var ConnectCmd = &cobra.Command{
 					continue
 				}
 				if pktType != network.PacketTun {
+					continue
+				}
+				// Reverse-path filter: the inner IPv4 source address must equal the
+				// sender's virtual IP. Otherwise a malicious member could inject packets
+				// spoofing another peer's virtual IP inside the (authenticated) tunnel.
+				expectedVIP, ok := addrToVIP.Load(addr.String())
+				if !ok || !bstun.SrcIPMatchesVirtualIP(plaintext, expectedVIP.(string)) {
 					continue
 				}
 				network.UpdateLastSeen()
@@ -393,7 +413,9 @@ var ConnectCmd = &cobra.Command{
 			for addr := range peerConn.Connected {
 				network.UpdateLastSeen()
 				if pubKey, ok := peerConn.PeerPublicKey(addr); ok {
-					virtualIPMap.Store(bstun.VirtualIPv4(pubKey), addr)
+					vip := bstun.VirtualIPv4(pubKey)
+					virtualIPMap.Store(vip, addr)
+					addrToVIP.Store(addr.String(), vip)
 					writePeers(&virtualIPMap)
 				}
 				if first {
@@ -412,6 +434,7 @@ func init() {
 	ConnectCmd.Flags().StringP("session", "s", "", "Session ID")
 	ConnectCmd.Flags().StringP("password", "p", "", "Session password")
 	ConnectCmd.Flags().BoolP("new", "n", false, "Create new session with password")
+	ConnectCmd.Flags().Bool("insecure", false, "Allow a plaintext http:// rendezvous (NOT recommended)")
 	ConnectCmd.MarkFlagRequired("session")
 	ConnectCmd.Flags().Bool("daemon", false, "")
 	ConnectCmd.Flags().String("status-file", "", "")

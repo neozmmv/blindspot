@@ -229,30 +229,50 @@ var ConnectCmd = &cobra.Command{
 		myPublicIP := strings.Split(publicAddr, ":")[0]
 		peerConn = network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
+		// knownPeers tracks which resolved peer addresses have been handed to
+		// AddKnownPeer, so rendezvous announcements are not re-added while a session
+		// is live. Entries are removed when a peer dies so it can reconnect later.
+		// Guarded by peersMu: it is touched by the initial loop, the SSE stream, the
+		// periodic re-register, and the Dead handler.
+		var peersMu sync.Mutex
 		knownPeers := make(map[string]bool)
 
-		for _, peer := range peers {
+		// addPeer validates a rendezvous-announced peer and, if it is new, registers
+		// its pinned static key and kicks off the Noise handshake.
+		addPeer := func(peer session.PeerAddr) {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
 				peerAddrStr = peer.Local
 			}
 			peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 			if err != nil {
-				continue
+				return
 			}
 			if !network.IsValidPeerAddr(peerAddr) {
-				continue // reject broadcast/multicast/unspecified IPs and privileged ports
+				return // reject broadcast/multicast/unspecified IPs and privileged ports
 			}
 			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
 			if err != nil || len(pub) != 32 {
-				continue // no valid pubkey from the rendezvous → cannot handshake
+				return // no valid pubkey from the rendezvous → cannot handshake
 			}
-			knownPeers[peerAddrStr] = true
-			// Register the rendezvous-pinned static key and kick off the Noise handshake.
+			peersMu.Lock()
+			if knownPeers[peerAddr.String()] {
+				peersMu.Unlock()
+				return
+			}
+			knownPeers[peerAddr.String()] = true
+			peersMu.Unlock()
 			peerConn.AddKnownPeer(peerAddr, pub)
 		}
 
-		// Periodically re-register to keep the rendezvous session TTL alive.
+		for _, peer := range peers {
+			addPeer(peer)
+		}
+
+		// Periodically re-register to keep the rendezvous session TTL alive. The
+		// response lists the session's current peers — feed it through addPeer so a
+		// peer that died and was forgotten (or an announcement the stream missed)
+		// gets picked up again.
 		go func() {
 			ticker := time.NewTicker(5 * time.Minute)
 			defer ticker.Stop()
@@ -261,7 +281,11 @@ var ConnectCmd = &cobra.Command{
 				case <-quit:
 					return
 				case <-ticker.C:
-					session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, false)
+					if current, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, false); err == nil {
+						for _, peer := range current {
+							addPeer(peer)
+						}
+					}
 				}
 			}
 		}()
@@ -269,26 +293,7 @@ var ConnectCmd = &cobra.Command{
 		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
 		go func() {
 			for peer := range peerStream {
-				peerAddrStr := peer.Public
-				if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
-					peerAddrStr = peer.Local
-				}
-				if knownPeers[peerAddrStr] {
-					continue
-				}
-				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
-				if err != nil {
-					continue
-				}
-				if !network.IsValidPeerAddr(peerAddr) {
-					continue // reject broadcast/multicast/unspecified IPs and privileged ports
-				}
-				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
-				if err != nil || len(pub) != 32 {
-					continue // no valid pubkey from the rendezvous → cannot handshake
-				}
-				knownPeers[peerAddrStr] = true
-				peerConn.AddKnownPeer(peerAddr, pub)
+				addPeer(peer)
 			}
 		}()
 
@@ -298,6 +303,10 @@ var ConnectCmd = &cobra.Command{
 		// reverse-path filter to verify the inner source IP of incoming tunnel packets.
 		var addrToVIP sync.Map
 
+		// Single place peer death is handled: both graceful departures (CtrlDead)
+		// and keepalive timeouts arrive on the Dead channel. Clear the routing
+		// mappings and forget the peer so a later rendezvous announcement (after a
+		// crash/rejoin) starts a fresh handshake instead of being ignored.
 		go func() {
 			for {
 				select {
@@ -313,6 +322,9 @@ var ConnectCmd = &cobra.Command{
 						return true
 					})
 					writePeers(&virtualIPMap)
+					peersMu.Lock()
+					delete(knownPeers, addr.String())
+					peersMu.Unlock()
 				}
 			}
 		}()
@@ -324,17 +336,6 @@ var ConnectCmd = &cobra.Command{
 				if err != nil {
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
-					}
-					if strings.Contains(err.Error(), "peer is dead") && addr != nil {
-						addrToVIP.Delete(addr.String())
-						virtualIPMap.Range(func(k, v any) bool {
-							if v.(*net.UDPAddr).String() == addr.String() {
-								virtualIPMap.Delete(k)
-								return false
-							}
-							return true
-						})
-						writePeers(&virtualIPMap)
 					}
 					continue
 				}

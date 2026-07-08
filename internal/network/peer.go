@@ -15,6 +15,18 @@ import (
 const (
 	// handshake retransmit cadence.
 	handshakeInterval = 150 * time.Millisecond
+	// handshakeAggressiveAttempts is how many retransmits stay at the aggressive
+	// cadence (≈6s of hole punching) before the interval backs off, so a peer that
+	// is gone for good is not flooded at 150ms forever.
+	handshakeAggressiveAttempts = 40
+	// handshakeMaxInterval caps the backed-off retransmit interval. It stays well
+	// under typical NAT UDP mapping timeouts (~30s) so the punch keeps the mapping
+	// open while we wait for the peer to come back.
+	handshakeMaxInterval = 5 * time.Second
+	// retryWindow bounds how long a re-armed handshake (after a keepalive timeout)
+	// keeps retrying before the session is parked. A parked session is revived by
+	// an inbound msg1 or a fresh rendezvous announcement.
+	retryWindow = 5 * time.Minute
 	// counterLen is the width of the explicit per-packet counter carried in every
 	// transport packet. The counter is used as the AEAD nonce so packets can be
 	// decrypted out of order and after loss (UDP reorders and drops freely), unlike
@@ -33,9 +45,17 @@ type peerSession struct {
 	hs           *noise.HandshakeState
 	tx           *noise.CipherState // our send cipher (per-direction, from Noise split)
 	rx           *noise.CipherState // our receive cipher
-	established  bool
-	initMsg      []byte // initiator: cached msg1 packet, retransmitted until established
-	respMsg      []byte // responder: cached msg2 packet, retransmitted on duplicate msg1
+	established bool
+	// driving is true while a handshake is in flight (armed and not yet
+	// established). It is cleared the moment the session establishes — not when
+	// the retransmit goroutine notices and exits — so a re-arm cannot be blocked
+	// by a driver that is merely sleeping between retransmits.
+	driving bool
+	// driverGen identifies the current driveHandshake goroutine. Re-arming bumps
+	// it, so a superseded driver exits without touching the new driver's state.
+	driverGen uint64
+	initMsg   []byte // initiator: cached msg1 packet, retransmitted until established
+	respMsg   []byte // responder: cached msg2 packet, retransmitted on duplicate msg1
 
 	// Anti-replay window for the receive direction (WireGuard/IPsec style).
 	// replayMax is the highest counter accepted so far; replayBits is a bitmap of
@@ -158,57 +178,93 @@ func (p *PeerConn) AddKnownPeer(addr *net.UDPAddr, remoteStatic []byte) error {
 	p.mu.Unlock()
 
 	s.mu.Lock()
-	if s.established || s.hs != nil {
-		// A handshake already exists (e.g. a responder session created on inbound
-		// msg1). Just record the expected key for later validation.
+	if s.established || s.driving {
+		// A handshake is already established or in flight (e.g. a responder session
+		// created on inbound msg1). Just record the expected key for later validation.
 		if s.expected == nil {
 			s.expected = key
 		}
 		s.mu.Unlock()
 		return nil
 	}
+	gen, err := p.armHandshakeLocked(s, key)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
+	go p.driveHandshake(s, gen, time.Time{})
+	return nil
+}
+
+// armHandshakeLocked (re)builds the handshake state for a session toward the peer
+// with static key `key`, replacing any stale in-flight state, and returns the
+// generation the caller must pass to the driveHandshake goroutine it starts. It
+// must be called with s.mu held and only when the session is neither established
+// nor driving (driving is set here so a concurrent arm cannot double-start).
+func (p *PeerConn) armHandshakeLocked(s *peerSession, key []byte) (uint64, error) {
 	s.expected = key
+	s.hs = nil
+	s.initMsg, s.respMsg = nil, nil
 	// Deterministic role assignment with no negotiation: the peer with the smaller
 	// static public key is the Noise initiator. Distinct keys guarantee no tie.
 	s.initiator = bytes.Compare(p.static.Public, key) < 0
 	if s.initiator {
 		hs, err := newInitiatorHandshake(p.static, key, p.psk, p.prologue)
 		if err != nil {
-			s.mu.Unlock()
-			return err
+			return 0, err
 		}
 		msg1, _, _, err := hs.WriteMessage(nil, nil)
 		if err != nil {
-			s.mu.Unlock()
-			return err
+			return 0, err
 		}
 		s.hs = hs
 		s.initMsg = buildPacket(PacketHandshakeInit, msg1)
 	}
-	s.mu.Unlock()
-
-	go p.driveHandshake(s)
-	return nil
+	s.driving = true
+	s.driverGen++
+	return s.driverGen, nil
 }
 
-// driveHandshake retransmits handshake traffic until the session is established
-// or Shutdown is called. The initiator resends msg1 (which doubles as a NAT
-// hole-punch); the responder sends empty punch packets to open its NAT mapping
-// while it waits for msg1.
+// driveHandshake retransmits handshake traffic until the session is established,
+// the deadline (if any) passes, or Shutdown is called. The initiator resends msg1
+// (which doubles as a NAT hole-punch); the responder sends empty punch packets to
+// open its NAT mapping while it waits for msg1.
 //
-// It retries for as long as the connection lives rather than giving up after a
-// fixed window: a peer that misses the initial hole-punch (transient NAT churn or
-// packet loss) must still be able to connect. The loop is bounded by p.stop, so it
-// stops promptly on shutdown and is not a goroutine leak.
-func (p *PeerConn) driveHandshake(s *peerSession) {
+// A zero deadline (rendezvous-driven handshakes) retries for as long as the
+// connection lives rather than giving up after a fixed window: a peer that misses
+// the initial hole-punch (transient NAT churn or packet loss) must still be able
+// to connect. Re-armed handshakes after a keepalive timeout pass a bounded
+// deadline; when it expires the session is parked (driving=false), from where an
+// inbound msg1 or a fresh AddKnownPeer can revive it. The retransmit cadence backs
+// off after the aggressive hole-punch phase so an absent peer is not flooded. The
+// loop is bounded by p.stop, so it stops promptly on shutdown and is not a
+// goroutine leak.
+func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time) {
+	defer func() {
+		s.mu.Lock()
+		// Only clear driving if this driver is still the current one: a re-arm may
+		// have superseded us (bumping driverGen) while we slept.
+		if s.driverGen == gen {
+			s.driving = false
+		}
+		s.mu.Unlock()
+	}()
 	punch := buildPacket(PacketPunch, nil)
+	interval := handshakeInterval
+	attempts := 0
 	for {
 		s.mu.Lock()
+		superseded := s.driverGen != gen
 		established := s.established
 		initiator := s.initiator
 		initMsg := s.initMsg
 		s.mu.Unlock()
-		if established {
+		if superseded || established {
+			return
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
 			return
 		}
 		if initiator && initMsg != nil {
@@ -216,10 +272,17 @@ func (p *PeerConn) driveHandshake(s *peerSession) {
 		} else {
 			p.conn.WriteToUDP(punch, s.addr)
 		}
+		attempts++
+		if attempts >= handshakeAggressiveAttempts && interval < handshakeMaxInterval {
+			interval *= 2
+			if interval > handshakeMaxInterval {
+				interval = handshakeMaxInterval
+			}
+		}
 		select {
 		case <-p.stop:
 			return
-		case <-time.After(handshakeInterval):
+		case <-time.After(interval):
 		}
 	}
 }
@@ -265,8 +328,9 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 				p.missedPings[addr.String()] = 0
 				p.mu.Unlock()
 			case CtrlDead:
-				p.dropSession(addr)
-				return PacketControl, nil, addr, fmt.Errorf("peer is dead")
+				// Authenticated "I'm leaving" from the peer: drop its session, surface
+				// a Dead event, and keep reading — other peers are unaffected.
+				p.RemovePeer(addr)
 			}
 			continue
 		case PacketData, PacketTun:
@@ -343,6 +407,7 @@ func (p *PeerConn) handleHandshakeInit(addr *net.UDPAddr, msg1 []byte) {
 	s.remoteStatic = append([]byte(nil), remote...)
 	s.respMsg = buildPacket(PacketHandshakeResp, msg2)
 	s.established = true
+	s.driving = false // the retransmit driver will notice and exit; the session may be re-armed before then
 	resp := s.respMsg
 	s.mu.Unlock()
 
@@ -382,6 +447,7 @@ func (p *PeerConn) handleHandshakeResp(addr *net.UDPAddr, msg2 []byte) {
 	s.tx, s.rx = cs0, cs1
 	s.remoteStatic = append([]byte(nil), remote...)
 	s.established = true
+	s.driving = false // the retransmit driver will notice and exit; the session may be re-armed before then
 	s.mu.Unlock()
 
 	p.fireConnected(addr)
@@ -509,12 +575,69 @@ func (p *PeerConn) dropSession(addr *net.UDPAddr) {
 	p.mu.Unlock()
 }
 
-func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
-	p.dropSession(addr)
+// fireDead delivers a Dead event reliably (mirror of fireConnected): dropping it
+// would leave consumers with stale virtual-IP mappings for the rest of the
+// session, so block until the consumer takes it or shutdown. Consumers of a
+// PeerConn must therefore drain Dead just like Connected.
+func (p *PeerConn) fireDead(addr *net.UDPAddr) {
 	select {
 	case p.Dead <- addr:
-	default:
+	case <-p.stop:
 	}
+}
+
+// RemovePeer drops a peer's session entirely and notifies the Dead channel. Used
+// for graceful departures (the peer said it is leaving); if the peer comes back it
+// will be re-announced by the rendezvous and re-added via AddKnownPeer.
+func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
+	p.dropSession(addr)
+	p.fireDead(addr)
+}
+
+// TimeoutPeer declares a peer dead after missed keepalives: consumers get a Dead
+// event so they drop mappings, and the handshake is re-armed for a bounded window
+// so the session heals on its own if the outage was transient (the peer never
+// told the rendezvous it left, so nothing else would ever reconnect the two).
+func (p *PeerConn) TimeoutPeer(addr *net.UDPAddr) {
+	p.mu.Lock()
+	delete(p.missedPings, addr.String())
+	p.mu.Unlock()
+	p.retryHandshake(addr)
+	p.fireDead(addr)
+}
+
+// retryHandshake resets an established-but-unresponsive session back to the
+// handshake phase, reusing the static key authenticated by the previous handshake
+// as the pinned key for the next one. The retry is bounded by retryWindow; after
+// that the session is parked until an inbound msg1 or AddKnownPeer revives it.
+func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
+	p.mu.Lock()
+	s, ok := p.sessions[addr.String()]
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.established || s.driving {
+		return
+	}
+	remote := s.remoteStatic
+	if remote == nil {
+		remote = s.expected
+	}
+	if remote == nil {
+		return
+	}
+	s.established = false
+	s.tx, s.rx = nil, nil
+	s.remoteStatic = nil
+	s.replayMax, s.replayBits = 0, 0
+	gen, err := p.armHandshakeLocked(s, remote)
+	if err != nil {
+		return
+	}
+	go p.driveHandshake(s, gen, time.Now().Add(retryWindow))
 }
 
 // establishedPeers returns the addresses of all currently established peers.

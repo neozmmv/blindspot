@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neozmmv/blindspot/internal/crypto"
@@ -80,29 +81,50 @@ var ChatCmd = &cobra.Command{
 			conn.Close()
 		}()
 
+		// knownPeers tracks which resolved peer addresses have been handed to
+		// AddKnownPeer; entries are removed when a peer dies so it can rejoin later.
+		// Guarded by peersMu: it is touched by the initial loop, the SSE stream, the
+		// periodic re-register, and the Dead handler.
+		var peersMu sync.Mutex
 		knownPeers := make(map[string]bool)
 
-		for _, peer := range peers {
+		// addPeer validates a rendezvous-announced peer and, if it is new, registers
+		// its pinned static key and kicks off the Noise handshake. It reports the
+		// chosen address and whether the peer was newly added, so callers can print.
+		addPeer := func(peer session.PeerAddr) (string, bool) {
 			peerAddrStr := peer.Public
 			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
-				fmt.Printf("Same network detected, connecting locally to %s\n", peer.Public)
 				peerAddrStr = peer.Local
 			}
 			peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
 			if err != nil {
-				fmt.Printf("Error resolving peer address: %v\n", err)
-				continue
+				return peerAddrStr, false
 			}
 			if !network.IsValidPeerAddr(peerAddr) {
-				continue // reject broadcast/multicast/unspecified IPs and privileged ports
+				return peerAddrStr, false // reject broadcast/multicast/unspecified IPs and privileged ports
 			}
 			pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
 			if err != nil || len(pub) != 32 {
-				continue // no valid pubkey from the rendezvous → cannot handshake
+				return peerAddrStr, false // no valid pubkey from the rendezvous → cannot handshake
 			}
-			fmt.Printf("Peer addr: %s\n", peerAddrStr)
-			knownPeers[peerAddrStr] = true
+			peersMu.Lock()
+			if knownPeers[peerAddr.String()] {
+				peersMu.Unlock()
+				return peerAddrStr, false
+			}
+			knownPeers[peerAddr.String()] = true
+			peersMu.Unlock()
 			peerConn.AddKnownPeer(peerAddr, pub)
+			return peerAddrStr, true
+		}
+
+		for _, peer := range peers {
+			if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
+				fmt.Printf("Same network detected, connecting locally to %s\n", peer.Public)
+			}
+			if addrStr, added := addPeer(peer); added {
+				fmt.Printf("Peer addr: %s\n", addrStr)
+			}
 		}
 
 		quit := make(chan struct{})
@@ -116,30 +138,47 @@ var ChatCmd = &cobra.Command{
 			close(quit)
 		}()
 
+		// Peer death (graceful CtrlDead or keepalive timeout) arrives on the Dead
+		// channel; forget the peer so it can reconnect via a fresh announcement.
+		go func() {
+			for {
+				select {
+				case <-quit:
+					return
+				case addr := <-peerConn.Dead:
+					fmt.Printf("\n[%s] disconnected.\n> ", addr)
+					peersMu.Lock()
+					delete(knownPeers, addr.String())
+					peersMu.Unlock()
+				}
+			}
+		}()
+
+		// Periodically re-register so the rendezvous TTL doesn't expire mid-chat;
+		// the response also re-announces peers we may have dropped or missed.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-quit:
+					return
+				case <-ticker.C:
+					if current, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, false); err == nil {
+						for _, peer := range current {
+							addPeer(peer)
+						}
+					}
+				}
+			}
+		}()
+
 		peerStream := session.StreamPeers(hostname, sessionId, password, publicAddr, quit)
 		go func() {
 			for peer := range peerStream {
-				peerAddrStr := peer.Public
-				if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
-					peerAddrStr = peer.Local
+				if addrStr, added := addPeer(peer); added {
+					fmt.Printf("\nNew peer discovered: %s\n> ", addrStr)
 				}
-				if knownPeers[peerAddrStr] {
-					continue
-				}
-				knownPeers[peerAddrStr] = true
-				peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
-				if err != nil {
-					continue
-				}
-				if !network.IsValidPeerAddr(peerAddr) {
-					continue // reject broadcast/multicast/unspecified IPs and privileged ports
-				}
-				pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
-				if err != nil || len(pub) != 32 {
-					continue // no valid pubkey from the rendezvous → cannot handshake
-				}
-				fmt.Printf("\nNew peer discovered: %s\n> ", peerAddrStr)
-				peerConn.AddKnownPeer(peerAddr, pub)
 			}
 		}()
 
@@ -148,10 +187,6 @@ var ChatCmd = &cobra.Command{
 			for {
 				pktType, plaintext, addr, err := peerConn.Read()
 				if err != nil {
-					if strings.Contains(err.Error(), "peer is dead") {
-						fmt.Printf("\n[%s] disconnected.\n> ", addr)
-						continue
-					}
 					if strings.Contains(err.Error(), "use of closed network connection") {
 						return
 					}

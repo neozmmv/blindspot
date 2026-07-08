@@ -12,6 +12,19 @@ var (
 	mu       sync.Mutex
 )
 
+const (
+	// keepaliveInterval is how often each established peer is pinged.
+	keepaliveInterval = 10 * time.Second
+	// keepaliveMissLimit is how many consecutive unanswered pings (~30s) it takes
+	// to declare a peer unresponsive and hand it to TimeoutPeer for re-handshake.
+	keepaliveMissLimit = 3
+	// watchdogSilence is the last-resort all-peers-silent threshold. It is well
+	// above keepaliveMissLimit*keepaliveInterval on purpose: individual dead peers
+	// are detected and healed per-peer by KeepAliveAll first, so this only fires
+	// when peers still look established yet nothing has been heard from anyone.
+	watchdogSilence = 90 * time.Second
+)
+
 // WatchConnection monitors for activity. hasPeers returns true when there are
 // currently connected peers — the timeout only fires when peers exist but are silent.
 func WatchConnection(conn *net.UDPConn, hasPeers func() bool) error {
@@ -23,7 +36,7 @@ func WatchConnection(conn *net.UDPConn, hasPeers func() bool) error {
 		mu.Lock()
 		since := time.Since(lastSeen)
 		mu.Unlock()
-		if since > 30*time.Second {
+		if since > watchdogSilence {
 			return fmt.Errorf("connection lost")
 		}
 	}
@@ -35,16 +48,24 @@ func UpdateLastSeen() {
 	mu.Unlock()
 }
 
+// KeepAliveAll pings every established peer on a fixed cadence and hands peers
+// that stop answering to TimeoutPeer, which tears down their mappings (Dead
+// event) and re-arms the handshake so a transient outage heals automatically.
+// The loop exits on Shutdown.
 func KeepAliveAll(p *PeerConn) {
 	for {
-		time.Sleep(10 * time.Second)
+		select {
+		case <-p.stop:
+			return
+		case <-time.After(keepaliveInterval):
+		}
 		for _, addr := range p.establishedPeers() {
 			p.mu.Lock()
 			missed := p.missedPings[addr.String()]
 			p.mu.Unlock()
-			if missed >= 9 {
-				fmt.Printf("Peer %v declared dead (no pong after %d pings)\n", addr, missed)
-				p.RemovePeer(addr)
+			if missed >= keepaliveMissLimit {
+				fmt.Printf("Peer %v unresponsive (no pong after %d pings), reconnecting...\n", addr, missed)
+				p.TimeoutPeer(addr)
 				continue
 			}
 			// Encrypted, authenticated keepalive; the reply resets missedPings.

@@ -57,43 +57,9 @@ type peerSession struct {
 	initMsg   []byte // initiator: cached msg1 packet, retransmitted until established
 	respMsg   []byte // responder: cached msg2 packet, retransmitted on duplicate msg1
 
-	// Anti-replay window for the receive direction (WireGuard/IPsec style).
-	// replayMax is the highest counter accepted so far; replayBits is a bitmap of
-	// the replayWindow counters ending at replayMax (bit i ⇒ counter replayMax-i seen).
-	replayMax  uint64
-	replayBits uint64
-}
-
-// replayWindow is the width of the anti-replay sliding window, in packets.
-const replayWindow = 64
-
-// checkReplayLocked reports whether counter is fresh (neither already seen nor
-// older than the window) and records it. It must be called with s.mu held, only
-// after the packet has been successfully authenticated, so that a forged packet
-// can never advance or poke holes in the window.
-func (s *peerSession) checkReplayLocked(counter uint64) bool {
-	if counter > s.replayMax {
-		shift := counter - s.replayMax
-		if shift >= replayWindow {
-			s.replayBits = 0
-		} else {
-			s.replayBits <<= shift
-		}
-		s.replayBits |= 1 // bit 0 marks the new replayMax
-		s.replayMax = counter
-		return true
-	}
-	// counter <= replayMax: it must fall within the window and not be seen yet.
-	diff := s.replayMax - counter
-	if diff >= replayWindow {
-		return false // too old
-	}
-	mask := uint64(1) << diff
-	if s.replayBits&mask != 0 {
-		return false // replay
-	}
-	s.replayBits |= mask
-	return true
+	// Anti-replay window for the receive direction, guarded by mu like the rest
+	// of the session state and consulted only after AEAD authentication.
+	replay ReplayWindow
 }
 
 type PeerConn struct {
@@ -111,6 +77,11 @@ type PeerConn struct {
 	Dead      chan *net.UDPAddr // signals when a peer is declared dead
 	stop      chan struct{}     // closed by Shutdown to stop background loops
 	stopOnce  sync.Once
+
+	// readBuf is the receive buffer reused across Read calls. Read is only ever
+	// called from a single reader goroutine; allocating 64 KB per packet would
+	// generate hundreds of MB/s of garbage at tunnel line rate.
+	readBuf []byte
 }
 
 // NewPeerConn creates a PeerConn. privateKey/publicKey are this peer's static
@@ -291,7 +262,10 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 // Callers filter on PacketData (chat) or PacketTun (VPN). Handshake, punch, and
 // keepalive packets are handled internally and never returned.
 func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
-	buf := make([]byte, 65536)
+	if p.readBuf == nil {
+		p.readBuf = make([]byte, 65536)
+	}
+	buf := p.readBuf
 	for {
 		n, addr, err := p.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -487,7 +461,7 @@ func (p *PeerConn) openTransport(addr *net.UDPAddr, pkt []byte) ([]byte, error) 
 	}
 	// Only after authentication do we consult the replay window, so a forged packet
 	// can never advance it or punch a hole in it.
-	if !s.checkReplayLocked(counter) {
+	if !s.replay.Check(counter) {
 		return nil, fmt.Errorf("replayed or out-of-window packet from %s", addr)
 	}
 	return plaintext, nil
@@ -500,7 +474,9 @@ func (p *PeerConn) send(addr *net.UDPAddr, data []byte, pktType byte) error {
 	if !ok {
 		return fmt.Errorf("unknown peer: %s", addr)
 	}
-	header := make([]byte, transportHeaderLen)
+	// Capacity covers header + ciphertext + AEAD tag so Encrypt's append never
+	// reallocates mid-packet.
+	header := make([]byte, transportHeaderLen, transportHeaderLen+len(data)+16)
 	header[0] = ProtocolVersion
 	header[1] = pktType
 
@@ -632,7 +608,7 @@ func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
 	s.established = false
 	s.tx, s.rx = nil, nil
 	s.remoteStatic = nil
-	s.replayMax, s.replayBits = 0, 0
+	s.replay = ReplayWindow{}
 	gen, err := p.armHandshakeLocked(s, remote)
 	if err != nil {
 		return

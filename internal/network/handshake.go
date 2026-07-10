@@ -16,6 +16,14 @@ func OpenUDPConn() (*net.UDPConn, string, error) {
 		return nil, "", err
 	}
 
+	// Large kernel socket buffers (same 7 MB wireguard-go uses). The OS default
+	// (~64 KB on Windows) holds only ~45 tunnel packets, so a burst from a fast
+	// TCP sender overflows it while the reader goroutine is busy decrypting;
+	// every drop looks like congestion to the tunnelled TCP stream and collapses
+	// throughput. Best effort: the OS may clamp the value (e.g. Linux rmem_max).
+	conn.SetReadBuffer(7 << 20)
+	conn.SetWriteBuffer(7 << 20)
+
 	// stun
 	serverAddr, err := net.ResolveUDPAddr("udp", "stun.l.google.com:19302")
 	if err != nil {

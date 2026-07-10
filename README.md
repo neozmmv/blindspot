@@ -17,36 +17,59 @@ Peer A                  Rendezvous                  Peer B
   |                         |                          |
   |<========= UDP hole punching (direct) ============>|
   |                         |                          |
-  |<========= X25519 handshake + AES-256-GCM ========>|
+  |<===== Noise IKpsk2 handshake (static keys ========>|
+  |          pinned from rendezvous over TLS)          |
   |                         |                          |
   |<========= encrypted P2P traffic =================>|
 ```
 
-If both peers are on the same local network, Blindspot detects this and connects via local IP instead — no internet round-trip.
+Static public keys are exchanged through the rendezvous over TLS and pinned **before** the handshake — so an on-path attacker who can see or tamper with the UDP traffic still cannot impersonate a peer. If both peers are on the same local network, Blindspot detects this and connects via local IP instead — no internet round-trip.
 
 
-## Blindspot Protocol
+## Blindspot Protocol (v2)
 
-Blindspot defines its own binary protocol over UDP. Each packet starts with a 1-byte type identifier followed by the payload.
+Blindspot defines its own binary protocol over UDP. As of **protocol version 2**, every packet on the wire is:
 
 ```
-Packet types:
-  0x01  HELLO       → hole punching + X25519 public key exchange
-  0x02  PING        → keepalive
-  0x03  PONG        → keepalive response
-  0x04  DATA        → encrypted chat payload (AES-256-GCM)
-  0x05  DEAD        → graceful disconnect notification
-  0x06  ACK         → acknowledgement (reserved)
-  0x07  TUN         → encrypted IP packet (VPN mode, AES-256-GCM)
+[Version:1][Type:1][Body...]
 ```
 
-**Handshake:** The `HELLO` packet carries a 32-byte X25519 public key. Both peers exchange keys during hole punching and derive a shared AES-256 key via ECDH. All `DATA` and `TUN` packets are encrypted with AES-256-GCM using a random nonce per packet.
+`Version` is `0x02`. A packet carrying any other version byte is dropped — peers never silently downgrade.
 
-**`DATA` vs `TUN`:** Chat messages use `PacketData (0x04)` and VPN traffic uses `PacketTun (0x07)`. They are encrypted identically but kept separate so the two modes can coexist on the same session without interference.
+```
+Outer packet types:
+  0x10  HANDSHAKE_INIT  → Noise IKpsk2 message 1 (initiator → responder)
+  0x11  HANDSHAKE_RESP  → Noise IKpsk2 message 2 (responder → initiator)
+  0x12  PUNCH           → empty NAT hole-punch keepalive during the handshake
+  0x04  DATA            → encrypted chat payload
+  0x07  TUN             → encrypted tunnelled IP packet (VPN mode)
+  0x08  CONTROL         → encrypted control message (inner opcode)
 
-**Virtual IPs:** Each peer derives its VPN address deterministically from its public key: `SHA256(publicKey)[0:3]` → `10.x.x.x/8`. No server involvement — every peer can compute every other peer's virtual IP from the keys exchanged during handshake.
+Inner control opcodes (plaintext inside an encrypted CONTROL packet):
+  0x01  PING            → keepalive
+  0x02  PONG            → keepalive response
+  0x03  DEAD            → graceful disconnect notification
+```
 
-**Identity** is a persistent X25519 keypair stored at `~/.blindspot/identity.json`, generated on first run.
+**Handshake — Noise IKpsk2.** v2 replaces the hand-rolled X25519/ECDH exchange with the [Noise Protocol Framework](https://noiseprotocol.org/) `IKpsk2` pattern, using the same cipher suite as WireGuard: **X25519** for Diffie–Hellman, **AES-256-GCM** for the AEAD, and **SHA-256** for hashing/HKDF. The peer with the lexicographically smaller static public key becomes the Noise initiator, so the role is decided deterministically without negotiation.
+
+- **Static keys are pinned, not exchanged in the clear.** Unlike v1 (where the public key rode inside the `HELLO` packet), the static public key is *never* sent on the wire. Each peer publishes its key to the trusted rendezvous over TLS, and both sides pin the other's key before the handshake begins. This is what neutralises an on-path attacker: they cannot substitute their own key for a peer's.
+- **Pre-shared key as a second factor.** The session password is stretched with **Argon2id** (64 MiB, 1 iteration, 4 lanes, salted with the session id) into a 32-byte PSK, mixed in at the `psk2` position. It is defense-in-depth: even if the rendezvous were compromised and published a forged static key, an attacker still could not complete the handshake without the password. Password-less ("open") sessions use a deterministic-but-public PSK, so authentication then rests entirely on the pinned static key.
+- **Prologue binding.** The handshake prologue commits to the protocol version and session id, so a handshake captured in one session or version can't be replayed into another.
+
+**Transport packets.** After the handshake, `DATA`, `TUN`, and `CONTROL` packets share one authenticated, anti-replay-protected channel. Each transport body is:
+
+```
+[Counter:8][AEAD ciphertext]
+```
+
+The AEAD's additional data (AAD) is the 10-byte cleartext header `[Version][Type][Counter]`, so the type and counter are authenticated — flipping either in transit fails the tag. The 64-bit `Counter` is a monotonic, per-direction value that doubles as the AEAD nonce (separate cipherstates secure each direction). The receiver enforces an **RFC 6479 sliding-window anti-replay filter** (2048-packet window, matching WireGuard) that is consulted *only after* a packet authenticates, so a forged packet can never advance the window or punch a hole in it.
+
+**`DATA` vs `TUN` vs `CONTROL`:** Chat messages use `DATA (0x04)`, VPN traffic uses `TUN (0x07)`, and keepalive/disconnect signalling rides inside encrypted `CONTROL (0x08)` packets. Because control traffic is encrypted and replay-protected like everything else, there is no cleartext keepalive or "peer dead" packet an attacker could forge (as there was in v1).
+
+**Virtual IPs:** Each peer derives its VPN address deterministically from its public key: `SHA256(publicKey)[0:3]` → `10.x.x.x/8`. No server involvement — every peer can compute every other peer's virtual IP from the pinned static keys. Tunnelled packets are also reverse-path filtered: a `TUN` packet whose source IP doesn't match the sender's virtual IP is dropped.
+
+**Identity** is a persistent X25519 keypair stored at `~/.blindspot/identity.json`, generated on first run. It can be encrypted at rest — see the [`identity`](#encrypting-your-identity-at-rest--identity) command.
 
 
 ## Installation
@@ -249,31 +272,35 @@ The signaling server only sees UDP addresses during the handshake — it never t
 
 ## Security
 
-- **Key exchange** — X25519 ECDH. Public keys are exchanged in the clear during hole punching; the shared secret never leaves either device.
-- **Encryption** — AES-256-GCM with a random nonce per packet. Integrity and authenticity are guaranteed by the GCM authentication tag.
-- **Identity** — Each device has a persistent X25519 keypair stored locally. The public key also determines the device's virtual IP in VPN mode.
+- **Handshake** — Noise `IKpsk2` (X25519 + AES-256-GCM + SHA-256, the WireGuard cipher suite). Static public keys are pinned from the trusted rendezvous over TLS and never sent on the wire, so an on-path attacker cannot impersonate a peer.
+- **Forward secrecy** — The Noise handshake mixes fresh ephemeral keypairs into every session. Compromise of a device's long-term static private key does **not** reveal traffic from past sessions.
+- **Second factor** — The session password is stretched with Argon2id into a pre-shared key mixed in at the `psk2` position, so a compromised rendezvous still cannot forge a session on a password-protected group.
+- **Encryption** — AES-256-GCM. Each transport packet uses a monotonic per-direction counter as its nonce, and the packet header (version, type, counter) is authenticated as AEAD associated data.
+- **Anti-replay** — An RFC 6479 sliding-window filter (2048-packet window) drops replayed or out-of-window packets, checked only after authentication succeeds.
+- **Identity** — Each device has a persistent X25519 keypair stored locally, optionally encrypted at rest (scrypt + AES-256-GCM). The public key also determines the device's virtual IP in VPN mode, and tunnelled packets are reverse-path filtered against it.
 - **No relay** — Traffic never passes through any server after the handshake. Only binary ciphertext is visible on the wire.
-
-> **Known limitation:** The current handshake does not provide forward secrecy. If a device's private key is compromised, past sessions could be decrypted. This will be addressed in a future version via ephemeral keypairs.
 
 ## Roadmap
 
 - [x] UDP hole punching (traverses NAT and CGNAT)
 - [x] Same-network detection → local IP fallback
-- [x] X25519 key exchange during handshake
-- [x] AES-256-GCM encryption
+- [x] Noise `IKpsk2` handshake (X25519 + AES-256-GCM + SHA-256)
+- [x] Static public keys pinned from the rendezvous (no key-in-the-clear)
+- [x] Forward secrecy via Noise ephemeral keypairs
+- [x] Argon2id pre-shared key as a second factor
+- [x] RFC 6479 sliding-window anti-replay
 - [x] Persistent device identity
-- [x] Keepalive + disconnect detection
-- [x] Graceful disconnect (DEAD packet)
+- [x] Encrypted identity at rest (scrypt + AES-256-GCM)
+- [x] Keepalive + disconnect detection (encrypted CONTROL channel)
+- [x] Graceful disconnect (encrypted DEAD control message)
 - [x] Password-protected sessions
-- [x] Binary protocol with typed packets
+- [x] Versioned binary protocol with typed packets
 - [x] Multi-peer mesh sessions
 - [x] VPN mode — Windows (WinTUN) and Linux
-- [x] Virtual IP derived from public key
+- [x] Virtual IP derived from public key + reverse-path filtering
 - [x] Background daemon with UAC auto-elevation (Windows)
 - [x] `disconnect` command with graceful shutdown
-- [ ] macOS TUN support
-- [ ] Forward secrecy via ephemeral keypairs
-- [ ] Reliable delivery (ACK + retransmission)
 - [x] File transfer (`send` / `receive` over the VPN tunnel)
+- [ ] macOS TUN support
+- [ ] Reliable delivery (ACK + retransmission)
 - [ ] System tray UI

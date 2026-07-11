@@ -1,36 +1,100 @@
-package gui
+package main
 
 import (
 	"embed"
+	"log"
+	"os"
+	"runtime"
+	"time"
 
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
+	"github.com/wailsapp/wails/v3/pkg/icons"
+
+	"github.com/neozmmv/blindspot/cmd"
+	"github.com/neozmmv/blindspot/internal/platform"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
 
-func Run() {
-	// Create an instance of the app structure
-	app := NewApp()
+func init() {
+	application.RegisterEvent[string]("time")
+}
 
-	// Create application with options
-	err := wails.Run(&options.App{
-		Title:  "blindspot-tray",
-		Width:  1024,
-		Height: 768,
-		AssetServer: &assetserver.Options{
-			Assets: assets,
+func main() {
+	if len(os.Args) > 1 {
+		if err := cmd.Execute(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if runtime.GOOS == "windows" && platform.WasLaunchedFromTerminal() {
+		platform.AttachToParentConsole()
+		if err := cmd.Execute(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	runGUI()
+}
+
+func runGUI() {
+	app := application.New(application.Options{
+		Name:        "Blindspot",
+		Description: "P2P Toolkit: VPN, File Sharing, Chat, and More",
+		Services: []application.Service{
+			application.NewService(&GreetService{}),
 		},
-		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
-		OnStartup:        app.startup,
-		Bind: []interface{}{
-			app,
+		Assets: application.AssetOptions{
+			Handler: application.AssetFileServerFS(assets),
+		},
+		Mac: application.MacOptions{
+			ActivationPolicy: application.ActivationPolicyAccessory,
 		},
 	})
 
-	if err != nil {
-		println("Error:", err.Error())
+	systemTray := app.SystemTray.New()
+
+	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Title:            "Blindspot",
+		Width:            400,
+		Height:           600,
+		Frameless:        true,
+		AlwaysOnTop:      true,
+		Hidden:           true,
+		DisableResize:    true,
+		HideOnEscape:     true,
+		HideOnFocusLost:  true,
+		BackgroundColour: application.NewRGB(6, 7, 15),
+		URL:              "/",
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar: true,
+		},
+	})
+
+	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		window.Hide()
+		e.Cancel()
+	})
+
+	if runtime.GOOS == "darwin" {
+		systemTray.SetTemplateIcon(icons.SystrayMacTemplate)
+	}
+
+	systemTray.AttachWindow(window).WindowOffset(5)
+
+	go func() {
+		for {
+			now := time.Now().Format(time.RFC1123)
+			app.Event.Emit("time", now)
+			time.Sleep(time.Second)
+		}
+	}()
+
+	if err := app.Run(); err != nil {
+		log.Fatal(err)
 	}
 }

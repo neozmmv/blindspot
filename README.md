@@ -1,3 +1,5 @@
+<img width=255 src='public/BLINDSPOT_BANNER.svg'>
+
 # Blindspot
 
 A P2P VPN and networking toolkit built on UDP hole punching with end-to-end encryption. Connect directly to peers without servers in the middle — traverses NAT and CGNAT automatically.

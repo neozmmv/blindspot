@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Events } from '@wailsio/runtime'
+import { Events, Window } from '@wailsio/runtime'
 import { TrayService } from '../bindings/github.com/neozmmv/blindspot/internal/gui'
 
 interface Peer {
@@ -53,6 +53,9 @@ const IconDownload = () => (
 const IconPower = () => (
   <svg viewBox="0 0 24 24" width="16" height="16" {...stroke}><path d="M12 4v8" /><path d="M7.2 7.2a7 7 0 1 0 9.6 0" /></svg>
 )
+/* const IconMinimize = () => (
+  <svg viewBox="0 0 24 24" width="16" height="16" {...stroke}><path d="M6 12h12" /></svg>
+) */
 
 function App() {
   const [status, setStatus] = useState<Status>(emptyStatus)
@@ -61,6 +64,8 @@ function App() {
   const [password, setPassword] = useState('')
   const [isNew, setIsNew] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [copiedPeer, setCopiedPeer] = useState('')
+  const [version, setVersion] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -72,6 +77,17 @@ function App() {
 
   useEffect(() => {
     refresh()
+    TrayService.Version()
+      .then((v) => {
+        // Release builds report a clean tag (e.g. "v1.3.10"); dev builds report a Go
+        // pseudo-version ("v1.3.10-0.<timestamp>-<hash>+dirty") — trim that noise.
+        const clean = String(v)
+          .replace(/^blindspot\s+/i, '')
+          .replace(/\+.*$/, '')
+          .replace(/-0\.\d{12,14}-[0-9a-f]+$/i, '')
+        setVersion(clean)
+      })
+      .catch(() => {})
     const off = Events.On('status', (ev: any) => {
       if (ev?.data) setStatus(ev.data as Status)
     })
@@ -109,6 +125,14 @@ function App() {
     } catch { /* clipboard unavailable */ }
   }
 
+  const copyPeer = async (ip: string) => {
+    try {
+      await navigator.clipboard.writeText(ip)
+      setCopiedPeer(ip)
+      window.setTimeout(() => setCopiedPeer(''), 1400)
+    } catch { /* clipboard unavailable */ }
+  }
+
   const sendTo = async (peerIP: string) => {
     try {
       const path = await TrayService.SelectFile()
@@ -133,10 +157,12 @@ function App() {
           <img className="logo" src="/blindspot-logo.png" alt="Blindspot" />
           <span className="brand-name">Blindspot</span>
         </div>
-        <span className={`pill ${status.connected ? 'pill-on' : 'pill-off'}`}>
-          <i className="pill-dot" />
-          {status.connected ? 'Connected' : 'Disconnected'}
-        </span>
+        <div className="topbar-right">
+          {version && <span className="version" title={version}>{version}</span>}
+          <button className="win-btn" onClick={() => Window.Hide()} title="Minimize" aria-label="Minimize">
+            —
+          </button>
+        </div>
       </header>
 
       {status.connected ? (
@@ -181,7 +207,17 @@ function App() {
                       <span className="peer-name">{p.virtualIP}</span>
                       <span className="peer-addr">{p.publicAddr}</span>
                     </span>
-                    <span className="peer-action"><IconSend /></span>
+                    <div className="peer-actions">
+                      <span className="peer-action" title="Send a file"><IconSend /></span>
+                      <button
+                        className="peer-copy"
+                        onClick={(e) => { e.stopPropagation(); copyPeer(p.virtualIP) }}
+                        title="Copy IP address"
+                        aria-label="Copy IP address"
+                      >
+                        {copiedPeer === p.virtualIP ? <IconCheck /> : <IconCopy />}
+                      </button>
+                    </div>
                     <span className="peer-drop"><IconDownload /> Drop to send</span>
                   </li>
                 ))}

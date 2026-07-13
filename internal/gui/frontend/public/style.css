@@ -67,22 +67,47 @@ button { font-family: inherit; }
 }
 .brand-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
 
-.pill {
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  /* Exempt the controls from the draggable title bar so clicks register. */
+  --wails-draggable: no-drag;
+}
+
+.win-btn {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 11px 5px 9px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 500;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin: 0;
+  line-height: 0;
+  flex-shrink: 0;
+  border-radius: 7px;
   border: 1px solid var(--border);
   background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
-.pill-dot { width: 7px; height: 7px; border-radius: 50%; }
-.pill-on { color: #d6f5e1; }
-.pill-on .pill-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18); }
-.pill-off { color: var(--text-2); }
-.pill-off .pill-dot { background: var(--text-3); }
+.win-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
+.win-btn svg { display: block; }
+
+.version {
+  flex-shrink: 1;
+  max-width: 140px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* ── content ─────────────────────────────────────────── */
 .content {
@@ -206,6 +231,24 @@ button { font-family: inherit; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.peer-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.peer-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  line-height: 0;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.peer-copy:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface); }
+.peer-copy svg { display: block; }
 .peer-action {
   display: grid;
   place-items: center;

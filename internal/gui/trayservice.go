@@ -49,11 +49,12 @@ type Status struct {
 // (connect / send / receive), and reading the on-disk session state directly for
 // everything else.
 type TrayService struct {
-	mu       sync.Mutex
-	busy     bool
-	transfer string
-	session  string    // the session name this tray connected to, if any
-	recvCmd  *exec.Cmd // running `receive` process, if any
+	mu            sync.Mutex
+	busy          bool
+	transfer      string
+	session       string    // the session name this tray connected to, if any
+	recvCmd       *exec.Cmd // running `receive` process, if any
+	recvCancelled bool      // set when the user stops the receive, so we clear rather than report
 }
 
 // cliExe returns the path to the blindspot CLI binary the tray shells out to. The
@@ -168,6 +169,26 @@ func (s *TrayService) setTransfer(msg string) {
 	s.emit()
 }
 
+// clearTransferAfter blanks the transfer line after d — but only if it still shows
+// msg and no receive is running, so a newer transfer's status is never wiped.
+func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
+	if msg == "" {
+		return
+	}
+	go func() {
+		time.Sleep(d)
+		s.mu.Lock()
+		cleared := s.transfer == msg && s.recvCmd == nil
+		if cleared {
+			s.transfer = ""
+		}
+		s.mu.Unlock()
+		if cleared {
+			s.emit()
+		}
+	}()
+}
+
 // Connect runs `blindspot connect -s <session> -p <password> [-n]`, which triggers
 // the UAC elevation + daemon launch and blocks until the session is up (or fails).
 // It returns the final status line the CLI printed.
@@ -272,14 +293,15 @@ func (s *TrayService) SendFile(peerIP, filePath string) (string, error) {
 	out, err := s.runCLI("send", peerIP, filePath)
 	last := lastLine(out)
 	if err != nil {
-		if last != "" {
-			s.setTransfer(last)
-			return "", fmt.Errorf("%s", last)
+		if last == "" {
+			last = "Send failed."
 		}
-		s.setTransfer("Send failed.")
-		return "", err
+		s.setTransfer(last)
+		s.clearTransferAfter(last, 8*time.Second)
+		return "", fmt.Errorf("%s", last)
 	}
 	s.setTransfer(last)
+	s.clearTransferAfter(last, 8*time.Second)
 	return last, nil
 }
 
@@ -328,11 +350,19 @@ func (s *TrayService) StartReceive(here bool) error {
 		cmd.Wait()
 		s.mu.Lock()
 		s.recvCmd = nil
-		if strings.HasPrefix(s.transfer, "Waiting") {
-			s.transfer = "Stopped waiting."
+		cancelled := s.recvCancelled
+		s.recvCancelled = false
+		result := s.transfer
+		// A user stop, or ending while still just waiting, leaves no useful result —
+		// clear the line so it doesn't linger. A real outcome (file saved, or an
+		// error mid-transfer) stays briefly, then auto-clears below.
+		if cancelled || strings.HasPrefix(result, "Waiting") {
+			s.transfer = ""
+			result = ""
 		}
 		s.mu.Unlock()
 		s.emit()
+		s.clearTransferAfter(result, 8*time.Second)
 	}()
 	return nil
 }
@@ -341,6 +371,9 @@ func (s *TrayService) StartReceive(here bool) error {
 func (s *TrayService) CancelReceive() error {
 	s.mu.Lock()
 	cmd := s.recvCmd
+	if cmd != nil {
+		s.recvCancelled = true
+	}
 	s.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return nil

@@ -21,6 +21,19 @@ jobs:
               with:
                 go-version: '1.25.6'
 
+            - name: Set up Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                bun-version: latest
+
+            # The tray binary embeds internal/gui/frontend/dist (//go:embed), which is
+            # gitignored, so the frontend must be compiled before `go build ./cmd/tray`.
+            - name: Build tray frontend
+              working-directory: internal/gui/frontend
+              run: |
+                bun install
+                bun run build
+
             - name: Build
               run: |
                 GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-linux-amd64 .

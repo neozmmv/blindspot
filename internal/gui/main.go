@@ -73,7 +73,10 @@ func Run() {
 		Hidden:           true,
 		DisableResize:    true,
 		HideOnEscape:     true,
-		HideOnFocusLost:  true,
+		// Stay open when the user alt-tabs or clicks away — the panel only hides via
+		// the minimize button, Escape, the tray icon, or clicking outside is a no-op.
+		// It keeps AlwaysOnTop so it floats above other windows while visible.
+		HideOnFocusLost:  false,
 		BackgroundColour: application.NewRGB(0, 0, 0),
 		URL:              "/",
 		EnableFileDrop:   true,
@@ -84,8 +87,12 @@ func Run() {
 
 	// Drag-and-drop send: each peer card in the frontend is tagged
 	// data-file-drop-target + data-peer-ip. Dropping OS files onto one fires this
-	// hook with the target's attributes, so we send each file to that peer.
-	window.RegisterHook(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
+	// with the target's attributes, so we send each file to that peer.
+	//
+	// Must be OnWindowEvent, NOT RegisterHook: Wails dispatches WindowFilesDropped
+	// only to eventListeners (OnWindowEvent), never to eventHooks (RegisterHook), so
+	// a hook here silently never fires — the drag highlight works but no send starts.
+	window.OnWindowEvent(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
 		ctx := e.Context()
 		files := ctx.DroppedFiles()
 		details := ctx.DropTargetDetails()

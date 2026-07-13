@@ -2,10 +2,22 @@ BINARY=blindspot
 VERSION=$(shell git describe --tags --abbrev=0)
 # VERSION HERE USE LATEST TAG
 
-.PHONY: build build-win build-linux
+.PHONY: build build-win build-linux frontend
 
-build-win:
+FRONTEND_DIR=internal/gui/frontend
+
+# The tray binary embeds internal/gui/frontend/dist (//go:embed), which is gitignored,
+# so the frontend must be compiled before building the tray.
+frontend:
+	cd $(FRONTEND_DIR) && bun install && bun run build
+
+# Two Windows binaries: the console-subsystem CLI (blindspot.exe) behaves like a
+# normal command-line tool from a terminal, and the GUI-subsystem tray
+# (blindspot-tray.exe, -H windowsgui) launches without ever opening a console. The
+# tray shells out to the CLI sitting next to it, so ship them in the same folder.
+build-win: frontend
 	GOOS=windows GOARCH=amd64 go build -ldflags="-X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY).exe .
+	GOOS=windows GOARCH=amd64 go build -ldflags="-H windowsgui -X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY)-tray.exe ./cmd/tray
 
 build-linux:
 	GOOS=linux GOARCH=amd64 go build -ldflags="-X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY)-linux-amd64 .

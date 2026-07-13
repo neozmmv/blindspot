@@ -1,3 +1,4 @@
 dist
 *.exe
 wintun.dll
+build

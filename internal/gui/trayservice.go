@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +36,9 @@ type Peer struct {
 type Status struct {
 	Connected bool   `json:"connected"`
 	MyIP      string `json:"myIP"`
+	Session   string `json:"session"`   // active session name, if this tray started it
 	Peers     []Peer `json:"peers"`
-	Busy      bool   `json:"busy"`     // a connect/send is in flight
+	Busy      bool   `json:"busy"`      // a connect/send is in flight
 	Receiving bool   `json:"receiving"` // a receive listener is running
 	Transfer  string `json:"transfer"`  // latest file-transfer status line
 }
@@ -50,17 +52,25 @@ type TrayService struct {
 	mu       sync.Mutex
 	busy     bool
 	transfer string
+	session  string    // the session name this tray connected to, if any
 	recvCmd  *exec.Cmd // running `receive` process, if any
 }
 
-// selfExe returns the path to the running blindspot binary so the tray can invoke
-// its own CLI subcommands.
-func selfExe() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "blindspot"
+// cliExe returns the path to the blindspot CLI binary the tray shells out to. The
+// tray ships alongside the CLI, so it prefers a blindspot(.exe) sitting next to
+// itself and falls back to whatever is on PATH.
+func cliExe() string {
+	name := "blindspot"
+	if runtime.GOOS == "windows" {
+		name = "blindspot.exe"
 	}
-	return exe
+	if exe, err := os.Executable(); err == nil {
+		sibling := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(sibling); err == nil {
+			return sibling
+		}
+	}
+	return name // resolved via PATH
 }
 
 func (s *TrayService) sessionRunning() bool {
@@ -120,11 +130,15 @@ func (s *TrayService) GetStatus() Status {
 		peers = []Peer{}
 	}
 	s.mu.Lock()
-	busy, transfer, receiving := s.busy, s.transfer, s.recvCmd != nil
+	busy, transfer, receiving, session := s.busy, s.transfer, s.recvCmd != nil, s.session
 	s.mu.Unlock()
+	if !connected {
+		session = "" // a stale session name shouldn't outlive the connection
+	}
 	return Status{
 		Connected: connected,
 		MyIP:      s.MyIP(),
+		Session:   session,
 		Peers:     peers,
 		Busy:      busy,
 		Receiving: receiving,
@@ -181,6 +195,11 @@ func (s *TrayService) Connect(session, password string, isNew bool) (string, err
 	defer s.setBusy(false)
 
 	out, err := s.runCLI(args...)
+	if err == nil && s.sessionRunning() {
+		s.mu.Lock()
+		s.session = session
+		s.mu.Unlock()
+	}
 	s.emit()
 	if err != nil {
 		if out != "" {
@@ -194,6 +213,9 @@ func (s *TrayService) Connect(session, password string, isNew bool) (string, err
 // Disconnect signals the running daemon to stop (the same mechanism as
 // `blindspot disconnect`) and waits briefly for it to tear down.
 func (s *TrayService) Disconnect() (string, error) {
+	s.mu.Lock()
+	s.session = ""
+	s.mu.Unlock()
 	if !s.sessionRunning() {
 		return "No active session.", nil
 	}
@@ -275,7 +297,7 @@ func (s *TrayService) StartReceive(here bool) error {
 	if here {
 		args = append(args, "--here")
 	}
-	cmd := exec.Command(selfExe(), args...)
+	cmd := exec.Command(cliExe(), args...)
 	hideConsole(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -338,7 +360,7 @@ func (s *TrayService) Version() string {
 // runCLI invokes a blindspot subcommand on this same binary and returns its
 // combined, trimmed output.
 func (s *TrayService) runCLI(args ...string) (string, error) {
-	cmd := exec.Command(selfExe(), args...)
+	cmd := exec.Command(cliExe(), args...)
 	hideConsole(cmd)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err

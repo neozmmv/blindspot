@@ -68,6 +68,14 @@ export class Status {
              */
             this["myIP"] = "";
         }
+        if (!("session" in $$source)) {
+            /**
+             * active session name, if this tray started it
+             * @member
+             * @type {string}
+             */
+            this["session"] = "";
+        }
         if (!("peers" in $$source)) {
             /**
              * @member
@@ -109,10 +117,10 @@ export class Status {
      * @returns {Status}
      */
     static createFrom($$source = {}) {
-        const $$createField2_0 = $$createType1;
+        const $$createField3_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("peers" in $$parsedSource) {
-            $$parsedSource["peers"] = $$createField2_0($$parsedSource["peers"]);
+            $$parsedSource["peers"] = $$createField3_0($$parsedSource["peers"]);
         }
         return new Status(/** @type {Partial<Status>} */($$parsedSource));
     }

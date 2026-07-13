@@ -26,9 +26,10 @@ jobs:
                 GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-linux-amd64 .
                 GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-linux-arm64 .
                 GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot.exe .
+                GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui -X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-tray.exe ./cmd/tray
                 GOOS=darwin GOARCH=amd64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-darwin-amd64 .
                 GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/neozmmv/blindspot/cmd.Version=${{ github.ref_name }}" -o blindspot-darwin-arm64 .
-            
+
             - name: Upload Artifacts
               uses: actions/upload-artifact@v4
               with:
@@ -37,6 +38,7 @@ jobs:
                   blindspot-linux-amd64
                   blindspot-linux-arm64
                   blindspot.exe
+                  blindspot-tray.exe
                   blindspot-darwin-amd64
                   blindspot-darwin-arm64
 
@@ -58,5 +60,6 @@ jobs:
                 blindspot-linux-amd64
                 blindspot-linux-arm64
                 blindspot.exe
+                blindspot-tray.exe
                 blindspot-darwin-amd64
                 blindspot-darwin-arm64

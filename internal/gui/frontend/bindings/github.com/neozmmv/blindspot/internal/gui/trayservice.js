@@ -70,7 +70,8 @@ export function MyIP() {
 
 /**
  * SelectFile opens a native file picker and returns the chosen path (empty if the
- * user cancelled).
+ * user cancelled). Cancellation is not an error — it returns "" so the frontend
+ * simply keeps the previous selection and nothing is logged.
  * @returns {$CancellablePromise<string>}
  */
 export function SelectFile() {

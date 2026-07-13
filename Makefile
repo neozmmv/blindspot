@@ -4,11 +4,13 @@ VERSION=$(shell git describe --tags --abbrev=0)
 
 .PHONY: build build-win build-linux
 
-# -H windowsgui builds a GUI-subsystem binary so double-clicking launches the tray
-# without a console window. CLI use still works: main.go calls AttachToParentConsole
-# when launched from an existing terminal.
+# Two Windows binaries: the console-subsystem CLI (blindspot.exe) behaves like a
+# normal command-line tool from a terminal, and the GUI-subsystem tray
+# (blindspot-tray.exe, -H windowsgui) launches without ever opening a console. The
+# tray shells out to the CLI sitting next to it, so ship them in the same folder.
 build-win:
-	GOOS=windows GOARCH=amd64 go build -ldflags="-H windowsgui -X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY).exe .
+	GOOS=windows GOARCH=amd64 go build -ldflags="-X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY).exe .
+	GOOS=windows GOARCH=amd64 go build -ldflags="-H windowsgui -X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY)-tray.exe ./cmd/tray
 
 build-linux:
 	GOOS=linux GOARCH=amd64 go build -ldflags="-X github.com/neozmmv/blindspot/cmd.Version=$(VERSION)" -o dist/$(BINARY)-linux-amd64 .

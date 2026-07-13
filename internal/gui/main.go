@@ -14,15 +14,20 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+// trayIcon is the tray/menu-bar icon. It must be a PNG (Wails' Windows SetIcon feeds
+// the bytes to CreateIconFromResourceEx, which rejects .ico containers).
+//
+//go:embed icon.png
+var trayIcon []byte
+
 func init() {
 	// Payload emitted to the frontend whenever the session state changes.
 	application.RegisterEvent[Status]("status")
 }
 
-// Run launches the system-tray GUI. It is invoked by the root binary when
-// blindspot is started with no CLI arguments (double-click / bare launch). icon is
-// the application icon (PNG or ICO bytes), embedded by the root package.
-func Run(icon []byte) {
+// Run launches the system-tray GUI. It is the entry point of the blindspot-tray
+// binary; the CLI lives in the separate console-subsystem blindspot binary.
+func Run() {
 	tray := &TrayService{}
 
 	// Declared up front so the SingleInstance callback below (and the tray menu) can
@@ -69,11 +74,33 @@ func Run(icon []byte) {
 		DisableResize:    true,
 		HideOnEscape:     true,
 		HideOnFocusLost:  true,
-		BackgroundColour: application.NewRGB(6, 7, 15),
+		BackgroundColour: application.NewRGB(0, 0, 0),
 		URL:              "/",
+		EnableFileDrop:   true,
 		Windows: application.WindowsWindow{
 			HiddenOnTaskbar: true,
 		},
+	})
+
+	// Drag-and-drop send: each peer card in the frontend is tagged
+	// data-file-drop-target + data-peer-ip. Dropping OS files onto one fires this
+	// hook with the target's attributes, so we send each file to that peer.
+	window.RegisterHook(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
+		ctx := e.Context()
+		files := ctx.DroppedFiles()
+		details := ctx.DropTargetDetails()
+		if details == nil || len(files) == 0 {
+			return
+		}
+		peerIP := details.Attributes["data-peer-ip"]
+		if peerIP == "" {
+			return
+		}
+		go func() {
+			for _, f := range files {
+				tray.SendFile(peerIP, f)
+			}
+		}()
 	})
 
 	// Closing the tray window just hides it — the app keeps running in the tray,
@@ -91,7 +118,7 @@ func Run(icon []byte) {
 	if runtime.GOOS == "darwin" {
 		systemTray.SetTemplateIcon(icons.SystrayMacTemplate)
 	} else {
-		systemTray.SetIcon(icon)
+		systemTray.SetIcon(trayIcon)
 	}
 	systemTray.SetTooltip("Blindspot")
 

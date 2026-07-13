@@ -10,6 +10,7 @@ interface Peer {
 interface Status {
   connected: boolean
   myIP: string
+  session: string
   peers: Peer[]
   busy: boolean
   receiving: boolean
@@ -19,33 +20,51 @@ interface Status {
 const emptyStatus: Status = {
   connected: false,
   myIP: '',
+  session: '',
   peers: [],
   busy: false,
   receiving: false,
   transfer: '',
 }
 
+/* Minimal line icons, sized by the surrounding font. */
+const stroke = {
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.75,
+  strokeLinecap: 'round' as const,
+  strokeLinejoin: 'round' as const,
+}
+const IconCopy = () => (
+  <svg viewBox="0 0 24 24" width="15" height="15" {...stroke}><rect x="9" y="9" width="11" height="11" rx="2.5" /><path d="M5 15V6a2 2 0 0 1 2-2h8" /></svg>
+)
+const IconCheck = () => (
+  <svg viewBox="0 0 24 24" width="15" height="15" {...stroke}><path d="M20 6L9 17l-5-5" /></svg>
+)
+const IconMonitor = () => (
+  <svg viewBox="0 0 24 24" width="18" height="18" {...stroke}><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
+)
+const IconSend = () => (
+  <svg viewBox="0 0 24 24" width="16" height="16" {...stroke}><path d="M21 3L11 13M21 3l-6.5 18-3.8-8.2L2.5 9 21 3z" /></svg>
+)
+const IconDownload = () => (
+  <svg viewBox="0 0 24 24" width="16" height="16" {...stroke}><path d="M12 4v10m0 0l-3.5-3.5M12 14l3.5-3.5M5 19h14" /></svg>
+)
+const IconPower = () => (
+  <svg viewBox="0 0 24 24" width="16" height="16" {...stroke}><path d="M12 4v8" /><path d="M7.2 7.2a7 7 0 1 0 9.6 0" /></svg>
+)
+
 function App() {
   const [status, setStatus] = useState<Status>(emptyStatus)
-  const [version, setVersion] = useState('')
   const [notice, setNotice] = useState('')
-
-  // connect form
   const [session, setSession] = useState('')
   const [password, setPassword] = useState('')
   const [isNew, setIsNew] = useState(false)
-
-  // send form
-  const [peerIP, setPeerIP] = useState('')
-  const [filePath, setFilePath] = useState('')
-  const [saveHere, setSaveHere] = useState(false)
-
   const [copied, setCopied] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
-      const s = await TrayService.GetStatus()
-      setStatus(s as Status)
+      setStatus((await TrayService.GetStatus()) as Status)
     } catch (e) {
       console.error(e)
     }
@@ -53,7 +72,6 @@ function App() {
 
   useEffect(() => {
     refresh()
-    TrayService.Version().then(setVersion).catch(() => {})
     const off = Events.On('status', (ev: any) => {
       if (ev?.data) setStatus(ev.data as Status)
     })
@@ -78,12 +96,8 @@ function App() {
   }
 
   const doDisconnect = async () => {
-    try {
-      const msg = await TrayService.Disconnect()
-      flash(msg)
-    } catch (e: any) {
-      flash(String(e?.message ?? e))
-    }
+    try { flash(await TrayService.Disconnect()) }
+    catch (e: any) { flash(String(e?.message ?? e)) }
   }
 
   const copyIP = async () => {
@@ -91,166 +105,159 @@ function App() {
     try {
       await navigator.clipboard.writeText(status.myIP)
       setCopied(true)
-      window.setTimeout(() => setCopied(false), 1200)
-    } catch { /* clipboard blocked */ }
+      window.setTimeout(() => setCopied(false), 1400)
+    } catch { /* clipboard unavailable */ }
   }
 
-  const chooseFile = async () => {
+  const sendTo = async (peerIP: string) => {
     try {
       const path = await TrayService.SelectFile()
-      if (path) setFilePath(path)
-    } catch (e: any) {
-      flash(String(e?.message ?? e))
-    }
-  }
-
-  const doSend = async () => {
-    try {
-      const msg = await TrayService.SendFile(peerIP, filePath)
-      flash(msg)
+      if (path) await TrayService.SendFile(peerIP, path)
     } catch (e: any) {
       flash(String(e?.message ?? e))
     }
   }
 
   const doReceive = async () => {
-    try {
-      await TrayService.StartReceive(saveHere)
-    } catch (e: any) {
-      flash(String(e?.message ?? e))
-    }
+    try { await TrayService.StartReceive(false) }
+    catch (e: any) { flash(String(e?.message ?? e)) }
   }
-
-  const cancelReceive = async () => {
+  const stopReceive = async () => {
     try { await TrayService.CancelReceive() } catch { /* ignore */ }
   }
-
-  const fileName = filePath ? filePath.replace(/^.*[\\/]/, '') : ''
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="dot-logo" aria-hidden="true" />
-          <span className="brand-name">blindspot</span>
+          <img className="logo" src="/blindspot-logo.png" alt="Blindspot" />
+          <span className="brand-name">Blindspot</span>
         </div>
         <span className={`pill ${status.connected ? 'pill-on' : 'pill-off'}`}>
-          <span className="pill-dot" />
-          {status.connected ? 'Connected' : 'Offline'}
+          <i className="pill-dot" />
+          {status.connected ? 'Connected' : 'Disconnected'}
         </span>
       </header>
 
-      <main className="body">
-        {status.connected ? (
-          <section className="card session-card">
-            <div className="row-between">
-              <div>
-                <div className="label">Your virtual IP</div>
-                <div className="myip">{status.myIP || '—'}</div>
-              </div>
-              <button className="btn ghost" onClick={copyIP} disabled={!status.myIP}>
-                {copied ? 'Copied' : 'Copy'}
-              </button>
-            </div>
-
-            <div className="peers">
-              <div className="label">
-                Peers <span className="count">{status.peers.length}</span>
-              </div>
-              {status.peers.length === 0 ? (
-                <div className="empty">No peers connected yet.</div>
-              ) : (
-                <ul className="peer-list">
-                  {status.peers.map((p) => (
-                    <li key={p.virtualIP} className="peer">
-                      <span className="peer-ip">{p.virtualIP}</span>
-                      <span className="peer-addr">{p.publicAddr}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            <button className="btn danger full" onClick={doDisconnect} disabled={status.busy}>
-              Disconnect
+      {status.connected ? (
+        <main className="content">
+          <section className="card summary">
+            <div className="summary-label">Your device</div>
+            <button className="ip-value" onClick={copyIP} title="Copy IP address">
+              <span className="ip-text">{status.myIP || '—'}</span>
+              <span className="copy-btn">{copied ? <><IconCheck /> Copied</> : <><IconCopy /> Copy</>}</span>
             </button>
+            <div className="summary-meta">
+              {status.session && <span className="chip">{status.session}</span>}
+              <span className="meta-dim">{status.peers.length} {status.peers.length === 1 ? 'peer' : 'peers'} connected</span>
+            </div>
           </section>
-        ) : (
-          <section className="card">
-            <div className="label">Join or create a session</div>
+
+          <section className="peers-block">
+            <div className="section-title">
+              <h2>Peers</h2>
+              <span className="hint-line">Drag a file onto a peer to send it</span>
+            </div>
+
+            {status.peers.length === 0 ? (
+              <div className="empty">
+                <div className="empty-title">No peers connected</div>
+                <p className="empty-body">Devices that join this network will appear here, ready to receive files.</p>
+              </div>
+            ) : (
+              <ul className="peer-list">
+                {status.peers.map((p) => (
+                  <li
+                    key={p.virtualIP}
+                    id={`peer-${p.virtualIP}`}
+                    className="peer"
+                    data-file-drop-target=""
+                    data-peer-ip={p.virtualIP}
+                    onClick={() => sendTo(p.virtualIP)}
+                    title={`Send a file to ${p.virtualIP}`}
+                  >
+                    <span className="peer-icon"><IconMonitor /></span>
+                    <span className="peer-info">
+                      <span className="peer-name">{p.virtualIP}</span>
+                      <span className="peer-addr">{p.publicAddr}</span>
+                    </span>
+                    <span className="peer-action"><IconSend /></span>
+                    <span className="peer-drop"><IconDownload /> Drop to send</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {status.transfer && (
+            <div className="transfer">
+              <span className="transfer-spinner" />
+              <span className="transfer-text">{status.transfer}</span>
+            </div>
+          )}
+
+          <div className="footer">
+            {status.receiving ? (
+              <button className="btn btn-secondary" onClick={stopReceive}>
+                <span className="live-dot" /> Stop receiving
+              </button>
+            ) : (
+              <button className="btn btn-secondary" onClick={doReceive}><IconDownload /> Receive a file</button>
+            )}
+            <button className="btn btn-danger" onClick={doDisconnect} disabled={status.busy}>
+              <IconPower /> Disconnect
+            </button>
+          </div>
+        </main>
+      ) : (
+        <main className="content">
+          <section className="card connect-card">
+            <h1 className="connect-title">Connect to a network</h1>
+            <p className="connect-sub">Join a session or create a new encrypted network.</p>
+
+            <label className="field-label" htmlFor="session">Network name</label>
             <input
+              id="session"
               className="input"
-              placeholder="Session name"
+              placeholder="e.g. home-office"
               value={session}
               onChange={(e) => setSession(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
               autoComplete="off"
+              autoFocus
             />
+
+            <label className="field-label" htmlFor="password">Password{!isNew && <span className="optional"> (optional)</span>}</label>
             <input
+              id="password"
               className="input"
               type="password"
-              placeholder={isNew ? 'Password (min 8 chars)' : 'Password (if any)'}
+              placeholder={isNew ? 'At least 8 characters' : 'Leave blank if none'}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
               autoComplete="off"
             />
-            <label className="check">
+
+            <label className="checkbox">
               <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
-              Create a new password-protected session
+              <span>Create a new encrypted network</span>
             </label>
-            <button className="btn primary full" onClick={doConnect} disabled={status.busy || !session}>
+
+            <button className="btn btn-primary btn-full" onClick={doConnect} disabled={status.busy || !session}>
               {status.busy ? 'Connecting…' : 'Connect'}
             </button>
-            <p className="hint">Connecting prompts for administrator access to set up the VPN adapter.</p>
+            <p className="connect-note">Connecting requires administrator access to set up the VPN adapter.</p>
           </section>
-        )}
 
-        <section className="card">
-          <div className="label">File transfer</div>
-
-          <div className="subgroup">
-            <div className="sublabel">Send</div>
-            <input
-              className="input"
-              placeholder="Peer virtual IP (10.x.x.x)"
-              value={peerIP}
-              onChange={(e) => setPeerIP(e.target.value)}
-              autoComplete="off"
-            />
-            <div className="file-row">
-              <button className="btn ghost" onClick={chooseFile}>Choose file</button>
-              <span className="file-name" title={filePath}>{fileName || 'No file selected'}</span>
-            </div>
-            <button
-              className="btn primary full"
-              onClick={doSend}
-              disabled={status.busy || !peerIP || !filePath}
-            >
-              {status.busy ? 'Sending…' : 'Send file'}
-            </button>
+          <div className="device-line">
+            <span className="device-k">Your device IP</span>
+            <span className="device-v">{status.myIP || '—'}</span>
           </div>
+        </main>
+      )}
 
-          <div className="subgroup">
-            <div className="sublabel">Receive</div>
-            <label className="check">
-              <input type="checkbox" checked={saveHere} onChange={(e) => setSaveHere(e.target.checked)} />
-              Save to current directory (default: Downloads)
-            </label>
-            {status.receiving ? (
-              <button className="btn danger full" onClick={cancelReceive}>Stop receiving</button>
-            ) : (
-              <button className="btn full" onClick={doReceive}>Wait for a file</button>
-            )}
-          </div>
-
-          {status.transfer && <div className="transfer">{status.transfer}</div>}
-        </section>
-      </main>
-
-      {notice && <div className="notice">{notice}</div>}
-
-      <footer className="footer">
-        <span>{version || 'blindspot'}</span>
-      </footer>
+      {notice && <div className="notice" role="status">{notice}</div>}
     </div>
   )
 }

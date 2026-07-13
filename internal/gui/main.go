@@ -1,52 +1,39 @@
-package main
+package gui
 
 import (
 	"embed"
 	"log"
-	"os"
 	"runtime"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"github.com/wailsapp/wails/v3/pkg/icons"
-
-	"github.com/neozmmv/blindspot/cmd"
-	"github.com/neozmmv/blindspot/internal/platform"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
 
 func init() {
-	application.RegisterEvent[string]("time")
+	// Payload emitted to the frontend whenever the session state changes.
+	application.RegisterEvent[Status]("status")
 }
 
-func main() {
-	if len(os.Args) > 1 {
-		if err := cmd.Execute(); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
+// Run launches the system-tray GUI. It is invoked by the root binary when
+// blindspot is started with no CLI arguments (double-click / bare launch). icon is
+// the application icon (PNG or ICO bytes), embedded by the root package.
+func Run(icon []byte) {
+	tray := &TrayService{}
 
-	if runtime.GOOS == "windows" && platform.WasLaunchedFromTerminal() {
-		platform.AttachToParentConsole()
-		if err := cmd.Execute(); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
+	// Declared up front so the SingleInstance callback below (and the tray menu) can
+	// close over it; assigned once the app exists.
+	var window *application.WebviewWindow
 
-	runGUI()
-}
-
-func runGUI() {
 	app := application.New(application.Options{
 		Name:        "Blindspot",
 		Description: "P2P Toolkit: VPN, File Sharing, Chat, and More",
 		Services: []application.Service{
-			application.NewService(&GreetService{}),
+			application.NewService(tray),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
@@ -54,11 +41,25 @@ func runGUI() {
 		Mac: application.MacOptions{
 			ActivationPolicy: application.ActivationPolicyAccessory,
 		},
+		// Enforce a single running tray: a second launch exits immediately and asks
+		// the existing instance to surface its window instead of opening another one.
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "dev.enzogp.blindspot.tray",
+			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
+				if window != nil {
+					window.Show().Focus()
+				}
+			},
+		},
 	})
 
 	systemTray := app.SystemTray.New()
 
-	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
+	// quitting flips true only when the user chooses Quit, so the close hook below
+	// knows to let the app actually terminate instead of just hiding the window.
+	quitting := false
+
+	window = app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            "Blindspot",
 		Width:            400,
 		Height:           600,
@@ -75,22 +76,47 @@ func runGUI() {
 		},
 	})
 
+	// Closing the tray window just hides it — the app keeps running in the tray,
+	// unless the user picked Quit from the tray menu.
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		if quitting {
+			return
+		}
 		window.Hide()
 		e.Cancel()
 	})
 
+	// Custom tray icon + hover tooltip. macOS wants a monochrome template icon, so
+	// keep the built-in there; every other platform gets the Blindspot icon.
 	if runtime.GOOS == "darwin" {
 		systemTray.SetTemplateIcon(icons.SystrayMacTemplate)
+	} else {
+		systemTray.SetIcon(icon)
 	}
+	systemTray.SetTooltip("Blindspot")
 
 	systemTray.AttachWindow(window).WindowOffset(5)
 
+	// Right-click menu on the tray icon. Left-click still toggles the panel;
+	// setting a menu makes Wails wire right-click to open it (see SystemTray.bind).
+	trayMenu := application.NewMenu()
+	trayMenu.Add("Show Blindspot").OnClick(func(_ *application.Context) {
+		window.Show().Focus()
+	})
+	trayMenu.AddSeparator()
+	trayMenu.Add("Quit Blindspot").OnClick(func(_ *application.Context) {
+		quitting = true
+		app.Quit()
+	})
+	systemTray.SetMenu(trayMenu)
+
+	// Push session status to the frontend on a slow tick so the panel reflects the
+	// daemon coming up, peers joining/leaving, or the daemon dying, without the UI
+	// having to poll over the bindings.
 	go func() {
 		for {
-			now := time.Now().Format(time.RFC1123)
-			app.Event.Emit("time", now)
-			time.Sleep(time.Second)
+			app.Event.Emit("status", tray.GetStatus())
+			time.Sleep(2 * time.Second)
 		}
 	}()
 

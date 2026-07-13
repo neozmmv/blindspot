@@ -1,120 +1,257 @@
-import { useState, useEffect, useRef } from 'react'
-import {Events, WML} from "@wailsio/runtime";
-import {GreetService} from "../bindings/github.com/neozmmv/blindspot/internal/gui";
+import { useState, useEffect, useCallback } from 'react'
+import { Events } from '@wailsio/runtime'
+import { TrayService } from '../bindings/github.com/neozmmv/blindspot/internal/gui'
 
-// Show the actual Wails version this project was generated against.
-const wailsVersion = "v3.0.0-alpha2.117";
+interface Peer {
+  virtualIP: string
+  publicAddr: string
+}
+
+interface Status {
+  connected: boolean
+  myIP: string
+  peers: Peer[]
+  busy: boolean
+  receiving: boolean
+  transfer: string
+}
+
+const emptyStatus: Status = {
+  connected: false,
+  myIP: '',
+  peers: [],
+  busy: false,
+  receiving: false,
+  transfer: '',
+}
 
 function App() {
-  const [name, setName] = useState<string>('');
-  const [time, setTime] = useState<string>('Listening for Time event...');
+  const [status, setStatus] = useState<Status>(emptyStatus)
+  const [version, setVersion] = useState('')
+  const [notice, setNotice] = useState('')
 
-  const titleNameRef = useRef<HTMLSpanElement | null>(null);
-  const toastRef = useRef<HTMLDivElement | null>(null);
-  const resultRef = useRef<HTMLSpanElement | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // connect form
+  const [session, setSession] = useState('')
+  const [password, setPassword] = useState('')
+  const [isNew, setIsNew] = useState(false)
 
-  // Crossfade the framework word in the heading ("Wails + React") to the name
-  // the user entered ("Wails + <name>"): the old word fades out while the new one
-  // fades in over the same spot.
-  const swapTitleName = (name: string) => {
-    const titleNameElement = titleNameRef.current;
-    if (!titleNameElement) {
-      return;
-    }
-    const current = titleNameElement.querySelector('.title-name-text:not(.is-outgoing)');
-    if (!current || current.textContent === name) {
-      return;
-    }
-    const incoming = document.createElement('span');
-    incoming.className = 'title-name-text is-entering';
-    incoming.textContent = name;
-    current.classList.add('is-outgoing');
-    titleNameElement.appendChild(incoming);
-    // Force a reflow so the transitions run from the starting state.
-    void incoming.offsetWidth;
-    incoming.classList.remove('is-entering');
-    current.classList.add('is-leaving');
-    current.addEventListener('transitionend', () => current.remove(), {once: true});
-  };
+  // send form
+  const [peerIP, setPeerIP] = useState('')
+  const [filePath, setFilePath] = useState('')
+  const [saveHere, setSaveHere] = useState(false)
 
-  // Pop the toast with the message Go returned, then auto-dismiss it.
-  const showToast = (message: string) => {
-    if (resultRef.current) {
-      resultRef.current.innerText = message;
-    }
-    if (toastRef.current) {
-      toastRef.current.classList.add('is-visible');
-    }
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => {
-      if (toastRef.current) {
-        toastRef.current.classList.remove('is-visible');
-      }
-    }, 4000);
-  };
+  const [copied, setCopied] = useState(false)
 
-  const doGreet = () => {
-    let n = name || 'anonymous';
-    swapTitleName(n);
-    GreetService.Greet(n).then(showToast).catch(console.error);
-  };
+  const refresh = useCallback(async () => {
+    try {
+      const s = await TrayService.GetStatus()
+      setStatus(s as Status)
+    } catch (e) {
+      console.error(e)
+    }
+  }, [])
 
   useEffect(() => {
-    Events.On('time', (timeValue: any) => {
-      // On a narrow screen the full RFC1123 stamp is too wide for the footer, so
-      // show just the clock time there (matching the CSS breakpoint).
-      const full = timeValue.data;
-      const compact = (full.match(/\d{1,2}:\d{2}:\d{2}/) || [full])[0];
-      setTime(window.matchMedia('(max-width: 640px)').matches ? compact : full);
-    });
-    // Reload WML so it picks up the wml tags
-    WML.Reload();
-  }, []);
+    refresh()
+    TrayService.Version().then(setVersion).catch(() => {})
+    const off = Events.On('status', (ev: any) => {
+      if (ev?.data) setStatus(ev.data as Status)
+    })
+    return () => { off?.() }
+  }, [refresh])
+
+  const flash = (msg: string) => {
+    setNotice(msg)
+    window.clearTimeout((flash as any)._t)
+    ;(flash as any)._t = window.setTimeout(() => setNotice(''), 5000)
+  }
+
+  const doConnect = async () => {
+    setNotice('')
+    try {
+      const msg = await TrayService.Connect(session, password, isNew)
+      flash(msg || 'Connected.')
+      setPassword('')
+    } catch (e: any) {
+      flash(String(e?.message ?? e))
+    }
+  }
+
+  const doDisconnect = async () => {
+    try {
+      const msg = await TrayService.Disconnect()
+      flash(msg)
+    } catch (e: any) {
+      flash(String(e?.message ?? e))
+    }
+  }
+
+  const copyIP = async () => {
+    if (!status.myIP) return
+    try {
+      await navigator.clipboard.writeText(status.myIP)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1200)
+    } catch { /* clipboard blocked */ }
+  }
+
+  const chooseFile = async () => {
+    try {
+      const path = await TrayService.SelectFile()
+      if (path) setFilePath(path)
+    } catch (e: any) {
+      flash(String(e?.message ?? e))
+    }
+  }
+
+  const doSend = async () => {
+    try {
+      const msg = await TrayService.SendFile(peerIP, filePath)
+      flash(msg)
+    } catch (e: any) {
+      flash(String(e?.message ?? e))
+    }
+  }
+
+  const doReceive = async () => {
+    try {
+      await TrayService.StartReceive(saveHere)
+    } catch (e: any) {
+      flash(String(e?.message ?? e))
+    }
+  }
+
+  const cancelReceive = async () => {
+    try { await TrayService.CancelReceive() } catch { /* ignore */ }
+  }
+
+  const fileName = filePath ? filePath.replace(/^.*[\\/]/, '') : ''
 
   return (
-    <>
-      <main className="container">
-        <header className="brand">
-          <a className="brand-mark" data-wml-openURL="https://v3.wails.io" aria-label="Wails website">
-            <img src="/wails.png" className="brand-logo" alt="Wails logo"/>
-          </a>
-          <a className="brand-badge" data-wml-openURL="https://reactjs.org" aria-label="React">
-            <img src="/react.svg" alt="React logo"/>
-          </a>
-        </header>
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="dot-logo" aria-hidden="true" />
+          <span className="brand-name">blindspot</span>
+        </div>
+        <span className={`pill ${status.connected ? 'pill-on' : 'pill-off'}`}>
+          <span className="pill-dot" />
+          {status.connected ? 'Connected' : 'Offline'}
+        </span>
+      </header>
 
-        <h1 className="title"><span className="title-accent">Wails +</span> <span className="title-name" ref={titleNameRef}><span className="title-name-text">React</span></span></h1>
-        <p className="subtitle">Build beautiful cross-platform apps with Go and React.</p>
+      <main className="body">
+        {status.connected ? (
+          <section className="card session-card">
+            <div className="row-between">
+              <div>
+                <div className="label">Your virtual IP</div>
+                <div className="myip">{status.myIP || '—'}</div>
+              </div>
+              <button className="btn ghost" onClick={copyIP} disabled={!status.myIP}>
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
 
-        <div className="greet">
-          <div className="input-box">
-            <svg className="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            <input aria-label="input" className="input" value={name} onChange={(e) => setName(e.target.value)} type="text" placeholder="Your name" autoComplete="off"/>
-            <button aria-label="greet-btn" className="btn" onClick={doGreet}>Greet
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div className="peers">
+              <div className="label">
+                Peers <span className="count">{status.peers.length}</span>
+              </div>
+              {status.peers.length === 0 ? (
+                <div className="empty">No peers connected yet.</div>
+              ) : (
+                <ul className="peer-list">
+                  {status.peers.map((p) => (
+                    <li key={p.virtualIP} className="peer">
+                      <span className="peer-ip">{p.virtualIP}</span>
+                      <span className="peer-addr">{p.publicAddr}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <button className="btn danger full" onClick={doDisconnect} disabled={status.busy}>
+              Disconnect
+            </button>
+          </section>
+        ) : (
+          <section className="card">
+            <div className="label">Join or create a session</div>
+            <input
+              className="input"
+              placeholder="Session name"
+              value={session}
+              onChange={(e) => setSession(e.target.value)}
+              autoComplete="off"
+            />
+            <input
+              className="input"
+              type="password"
+              placeholder={isNew ? 'Password (min 8 chars)' : 'Password (if any)'}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="off"
+            />
+            <label className="check">
+              <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
+              Create a new password-protected session
+            </label>
+            <button className="btn primary full" onClick={doConnect} disabled={status.busy || !session}>
+              {status.busy ? 'Connecting…' : 'Connect'}
+            </button>
+            <p className="hint">Connecting prompts for administrator access to set up the VPN adapter.</p>
+          </section>
+        )}
+
+        <section className="card">
+          <div className="label">File transfer</div>
+
+          <div className="subgroup">
+            <div className="sublabel">Send</div>
+            <input
+              className="input"
+              placeholder="Peer virtual IP (10.x.x.x)"
+              value={peerIP}
+              onChange={(e) => setPeerIP(e.target.value)}
+              autoComplete="off"
+            />
+            <div className="file-row">
+              <button className="btn ghost" onClick={chooseFile}>Choose file</button>
+              <span className="file-name" title={filePath}>{fileName || 'No file selected'}</span>
+            </div>
+            <button
+              className="btn primary full"
+              onClick={doSend}
+              disabled={status.busy || !peerIP || !filePath}
+            >
+              {status.busy ? 'Sending…' : 'Send file'}
             </button>
           </div>
-        </div>
+
+          <div className="subgroup">
+            <div className="sublabel">Receive</div>
+            <label className="check">
+              <input type="checkbox" checked={saveHere} onChange={(e) => setSaveHere(e.target.checked)} />
+              Save to current directory (default: Downloads)
+            </label>
+            {status.receiving ? (
+              <button className="btn danger full" onClick={cancelReceive}>Stop receiving</button>
+            ) : (
+              <button className="btn full" onClick={doReceive}>Wait for a file</button>
+            )}
+          </div>
+
+          {status.transfer && <div className="transfer">{status.transfer}</div>}
+        </section>
       </main>
 
-      <hr className="footer-divider"/>
-      <footer className="footer">
-        <span className="footer-version"><span>{wailsVersion}</span></span>
-        <span className="footer-time">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          <span>{time}</span>
-        </span>
-        <a className="footer-docs" data-wml-openURL="https://v3.wails.io" aria-label="Wails documentation">Docs
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>
-        </a>
-      </footer>
+      {notice && <div className="notice">{notice}</div>}
 
-      <div className="toast" ref={toastRef} role="status" aria-live="polite">
-        <span className="toast-label">From Go</span>
-        <span aria-label="result" className="toast-msg" ref={resultRef}></span>
-      </div>
-    </>
+      <footer className="footer">
+        <span>{version || 'blindspot'}</span>
+      </footer>
+    </div>
   )
 }
 

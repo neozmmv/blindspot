@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"os"
 	"runtime"
 
@@ -8,6 +9,18 @@ import (
 	"github.com/neozmmv/blindspot/internal/gui"
 	"github.com/neozmmv/blindspot/internal/platform"
 )
+
+// appIcon is embedded here (not in internal/gui) because go:embed can only reach
+// files at or below the embedding package's directory — it can't use ".." to climb
+// out. The repo root sits above public/, so it can embed the icon and hand the
+// bytes to the GUI, avoiding a duplicate copy inside internal/gui.
+//
+// It must be a PNG, not an .ico: Wails' tray SetIcon feeds the bytes straight to
+// CreateIconFromResourceEx, which wants a single image — an .ico container's
+// directory header makes it render blank.
+//
+//go:embed public/BLINDSPOT_tray.png
+var appIcon []byte
 
 func main() {
 	// Explicit CLI command (e.g. "blindspot connect ...", "blindspot list")
@@ -30,5 +43,5 @@ func main() {
 	}
 
 	// Double-click (Windows) or plain "./blindspot" launched fresh (Linux) -> tray
-	gui.Run()
+	gui.Run(appIcon)
 }

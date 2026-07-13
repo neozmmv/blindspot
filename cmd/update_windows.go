@@ -17,6 +17,7 @@ import (
 var pwshScript = `
 $ErrorActionPreference = "Stop"
 $Base     = "https://github.com/neozmmv/blindspot/releases/latest/download"
+$RawIcon  = "https://raw.githubusercontent.com/neozmmv/blindspot/master/public/BLINDSPOT.ico"
 $CliDest  = $env:BS_CLI_DEST
 $TrayDest = $env:BS_TRAY_DEST
 $TmpCli   = "$env:TEMP\blindspot_update.exe"
@@ -25,6 +26,29 @@ $TmpTray  = "$env:TEMP\blindspot_tray_update.exe"
 Write-Host "Downloading latest Blindspot (CLI + tray)..."
 Invoke-WebRequest -Uri "$Base/blindspot.exe"      -OutFile $TmpCli
 Invoke-WebRequest -Uri "$Base/blindspot-tray.exe" -OutFile $TmpTray
+
+# Refresh the Start Menu shortcut so the tray stays findable in search after an
+# update. Older installs may lack it (update used to only swap binaries), which
+# left the tray unsearchable since the exes live in WindowsApps, not a shortcut.
+$InstallDir = Split-Path $TrayDest
+$IconPath   = "$InstallDir\blindspot.ico"
+try {
+    Invoke-WebRequest -Uri $RawIcon -OutFile $IconPath -ErrorAction Stop
+} catch {
+    $IconPath = $null
+}
+try {
+    $Shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "Blindspot.lnk"
+    $Shell = New-Object -ComObject WScript.Shell
+    $Link = $Shell.CreateShortcut($Shortcut)
+    $Link.TargetPath       = $TrayDest
+    $Link.WorkingDirectory = $InstallDir
+    $Link.Description       = "Blindspot - P2P VPN tray"
+    if ($IconPath) { $Link.IconLocation = "$IconPath,0" }
+    $Link.Save()
+} catch {
+    Write-Host "Note: could not refresh Start Menu shortcut: $_"
+}
 
 # Restart the tray afterwards only if it is currently running.
 $restartLine = ""

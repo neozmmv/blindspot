@@ -31,8 +31,11 @@ func Run() {
 	tray := &TrayService{}
 
 	// Declared up front so the SingleInstance callback below (and the tray menu) can
-	// close over it; assigned once the app exists.
+	// close over them; assigned once the app exists. The tray is captured too so those
+	// paths open the panel anchored to the tray icon (ShowWindow) rather than letting
+	// Wails center a bare window.Show().
 	var window *application.WebviewWindow
+	var systemTray *application.SystemTray
 
 	app := application.New(application.Options{
 		Name:        "Blindspot",
@@ -51,14 +54,16 @@ func Run() {
 		SingleInstance: &application.SingleInstanceOptions{
 			UniqueID: "dev.enzogp.blindspot.tray",
 			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
-				if window != nil {
+				if systemTray != nil {
+					systemTray.ShowWindow() // anchored to the tray, like a tray-icon click
+				} else if window != nil {
 					window.Show().Focus()
 				}
 			},
 		},
 	})
 
-	systemTray := app.SystemTray.New()
+	systemTray = app.SystemTray.New()
 
 	// quitting flips true only when the user chooses Quit, so the close hook below
 	// knows to let the app actually terminate instead of just hiding the window.
@@ -135,7 +140,7 @@ func Run() {
 	// setting a menu makes Wails wire right-click to open it (see SystemTray.bind).
 	trayMenu := application.NewMenu()
 	trayMenu.Add("Show Blindspot").OnClick(func(_ *application.Context) {
-		window.Show().Focus()
+		systemTray.ShowWindow() // anchored to the tray, like a tray-icon click
 	})
 	trayMenu.AddSeparator()
 	trayMenu.Add("Quit Blindspot").OnClick(func(_ *application.Context) {

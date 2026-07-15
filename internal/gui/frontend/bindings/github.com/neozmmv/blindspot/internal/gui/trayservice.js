@@ -28,16 +28,18 @@ export function CancelReceive() {
 }
 
 /**
- * Connect runs `blindspot connect -s <session> -p <password> [-n]`, which triggers
- * the UAC elevation + daemon launch and blocks until the session is up (or fails).
- * It returns the final status line the CLI printed.
+ * Connect runs `blindspot connect -s <session> -p <password> [-n] [-H <hostname>]`,
+ * which triggers the UAC elevation + daemon launch and blocks until the session is
+ * up (or fails). A non-empty hostname overrides the default rendezvous server. It
+ * returns the final status line the CLI printed.
  * @param {string} session
  * @param {string} password
  * @param {boolean} isNew
+ * @param {string} hostname
  * @returns {$CancellablePromise<string>}
  */
-export function Connect(session, password, isNew) {
-    return $Call.ByID(1698713851, session, password, isNew);
+export function Connect(session, password, isNew, hostname) {
+    return $Call.ByID(1698713851, session, password, isNew, hostname);
 }
 
 /**

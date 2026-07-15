@@ -63,6 +63,8 @@ function App() {
   const [session, setSession] = useState('')
   const [password, setPassword] = useState('')
   const [isNew, setIsNew] = useState(false)
+  const [useCustomRendezvous, setUseCustomRendezvous] = useState(false)
+  const [hostname, setHostname] = useState('')
   const [copied, setCopied] = useState(false)
   const [copiedPeer, setCopiedPeer] = useState('')
   const [version, setVersion] = useState('')
@@ -103,7 +105,8 @@ function App() {
   const doConnect = async () => {
     setNotice('')
     try {
-      const msg = await TrayService.Connect(session, password, isNew)
+      const rendezvous = useCustomRendezvous ? hostname : ''
+      const msg = await TrayService.Connect(session, password, isNew, rendezvous)
       flash(msg || 'Connected.')
       setPassword('')
     } catch (e: any) {
@@ -255,7 +258,7 @@ function App() {
             <input
               id="session"
               className="input"
-              placeholder="e.g. home-office"
+              placeholder="e.g. blindspot-friends"
               value={session}
               onChange={(e) => setSession(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
@@ -279,6 +282,27 @@ function App() {
               <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
               <span>Create a new encrypted network</span>
             </label>
+
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={useCustomRendezvous}
+                onChange={(e) => setUseCustomRendezvous(e.target.checked)}
+              />
+              <span>Use a custom rendezvous server</span>
+            </label>
+
+            {useCustomRendezvous && (
+              <input
+                id="hostname"
+                className="input"
+                placeholder="e.g. rendezvous.trycloudflare.com"
+                value={hostname}
+                onChange={(e) => setHostname(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
+                autoComplete="off"
+              />
+            )}
 
             <button className="btn btn-primary btn-full" onClick={doConnect} disabled={status.busy || !session}>
               {status.busy ? 'Connecting…' : 'Connect'}

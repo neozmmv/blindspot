@@ -189,10 +189,11 @@ func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
 	}()
 }
 
-// Connect runs `blindspot connect -s <session> -p <password> [-n]`, which triggers
-// the UAC elevation + daemon launch and blocks until the session is up (or fails).
-// It returns the final status line the CLI printed.
-func (s *TrayService) Connect(session, password string, isNew bool) (string, error) {
+// Connect runs `blindspot connect -s <session> -p <password> [-n] [-H <hostname>]`,
+// which triggers the UAC elevation + daemon launch and blocks until the session is
+// up (or fails). A non-empty hostname overrides the default rendezvous server. It
+// returns the final status line the CLI printed.
+func (s *TrayService) Connect(session, password string, isNew bool, hostname string) (string, error) {
 	session = strings.TrimSpace(session)
 	if session == "" {
 		return "", fmt.Errorf("session name is required")
@@ -210,6 +211,9 @@ func (s *TrayService) Connect(session, password string, isNew bool) (string, err
 	}
 	if isNew {
 		args = append(args, "-n")
+	}
+	if hostname = strings.TrimSpace(hostname); hostname != "" {
+		args = append(args, "-H", hostname)
 	}
 
 	s.setBusy(true)

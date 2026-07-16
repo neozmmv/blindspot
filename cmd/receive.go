@@ -1,14 +1,12 @@
 package cmd
 
 import (
-	"encoding/binary"
+	"context"
 	"fmt"
-	"io"
-	"net"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/transfer"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
 	"github.com/spf13/cobra"
@@ -36,77 +34,56 @@ var ReceiveCmd = &cobra.Command{
 				return
 			}
 		} else {
-			home, err := os.UserHomeDir()
+			destDir, err = transfer.DownloadsDir()
 			if err != nil {
-				fmt.Println("Error finding home directory:", err)
-				return
-			}
-			destDir = filepath.Join(home, "Downloads")
-			if err := os.MkdirAll(destDir, 0755); err != nil {
-				fmt.Println("Error creating Downloads directory:", err)
+				fmt.Println(err)
 				return
 			}
 		}
 
 		myIP := bstun.VirtualIPv4(publicKey)
-		ln, err := net.Listen("tcp", myIP+transferPort)
+		recv, err := transfer.Listen(context.Background(), myIP)
 		if err != nil {
-			fmt.Printf("Could not listen on %s: %v\n", myIP+transferPort, err)
+			fmt.Println(err)
 			return
 		}
-		defer ln.Close()
+		defer recv.Close()
 
-		fmt.Printf("Waiting for file on %s...\n", myIP+transferPort)
+		fmt.Printf("Waiting for file on %s...\n", recv.Addr())
 
-		conn, err := ln.Accept()
+		// Render progress off a goroutine: the first snapshot prints the "Receiving…"
+		// header, later snapshots overwrite a single live line via carriage return.
+		prog := make(chan transfer.Progress, 1)
+		renderDone := make(chan struct{})
+		go func() {
+			var lr transfer.LineRenderer
+			first := true
+			for p := range prog {
+				if first {
+					first = false
+					lr.Seed(p)
+					fmt.Printf("Receiving %s (%d MB) from %s...\n", p.Name, p.Total/(1024*1024), p.PeerAddr)
+					continue
+				}
+				fmt.Print("\r" + lr.Line(p))
+			}
+			close(renderDone)
+		}()
+
+		res, err := recv.Accept(context.Background(), destDir, prog)
+		close(prog)
+		<-renderDone
+
+		if enteredBody(err) {
+			fmt.Println()
+		}
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			fmt.Println(err)
 			return
 		}
-		defer conn.Close()
-
-		var nameLen uint16
-		if err := binary.Read(conn, binary.BigEndian, &nameLen); err != nil {
-			fmt.Println("Error reading filename length:", err)
-			return
-		}
-		nameBuf := make([]byte, nameLen)
-		if _, err := io.ReadFull(conn, nameBuf); err != nil {
-			fmt.Println("Error reading filename:", err)
-			return
-		}
-
-		var fileSize uint64
-		if err := binary.Read(conn, binary.BigEndian, &fileSize); err != nil {
-			fmt.Println("Error reading file size:", err)
-			return
-		}
-
-		filename := string(nameBuf)
-		destPath := filepath.Join(destDir, filename)
-		fmt.Printf("Receiving %s (%d MB) from %s...\n", filename, fileSize/(1024*1024), conn.RemoteAddr())
-
-		f, err := os.Create(destPath)
-		if err != nil {
-			fmt.Println("Error creating file:", err)
-			return
-		}
-		defer f.Close()
-
-		pw := &progressWriter{w: f}
-		stop := startProgress(int64(fileSize), pw)
-		start := time.Now()
-		n, err := io.CopyN(pw, conn, int64(fileSize))
-		stop()
-		fmt.Println()
-		if err != nil {
-			fmt.Printf("Error receiving file (got %d/%d bytes): %v\n", n, fileSize, err)
-			return
-		}
-		elapsed := time.Since(start)
 		fmt.Printf("Saved to %s — %s in %s (avg %s/s)\n",
-			destPath, formatBytes(float64(n)), elapsed.Round(time.Millisecond),
-			formatBytes(float64(n)/elapsed.Seconds()))
+			res.Path, transfer.FormatBytes(float64(res.Bytes)), res.Elapsed.Round(time.Millisecond),
+			transfer.FormatBytes(float64(res.Bytes)/res.Elapsed.Seconds()))
 	},
 }
 

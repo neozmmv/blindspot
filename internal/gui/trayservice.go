@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,9 +14,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 
 	"github.com/neozmmv/blindspot/internal/transfer"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
@@ -43,6 +47,20 @@ type Status struct {
 	Busy      bool   `json:"busy"`      // a connect/send is in flight
 	Receiving bool   `json:"receiving"` // a receive listener is running
 	Transfer  string `json:"transfer"`  // latest file-transfer status line
+
+	// Consent handshake (see requests.go).
+	AwaitingAccept bool             `json:"awaitingAccept"` // sender: waiting for a peer to accept
+	AwaitingPeer   string           `json:"awaitingPeer"`   // sender: peer we're waiting on
+	Incoming       *IncomingRequest `json:"incoming"`       // receiver: pending inbound request, if any
+}
+
+// IncomingRequest is a pending inbound file offer surfaced to the frontend as an
+// Accept/Decline card. It mirrors the native toast.
+type IncomingRequest struct {
+	ID       string `json:"id"`
+	PeerIP   string `json:"peerIP"`
+	Filename string `json:"filename"`
+	Size     string `json:"size"`
 }
 
 // TrayService is the bridge exposed to the frontend. It shells out to the blindspot
@@ -56,6 +74,21 @@ type TrayService struct {
 	session    string             // the session name this tray connected to, if any
 	receiver   *transfer.Receiver // in-process receive listener, while a receive is running
 	recvCancel context.CancelFunc // cancels the running receive
+
+	// Consent handshake state (see requests.go). All fields below are guarded by mu.
+	reqLn      net.Listener    // control-channel listener on myIP:28126 while connected
+	reqBoundIP string          // the IP reqLn is bound to (to detect a virtual-IP change)
+	pendingIn  *inboundRequest // at most one pending inbound request (single-flight)
+	reqCounter uint64          // monotonic source for request IDs
+
+	pendingOutConn net.Conn // sender: open control conn while awaiting a decision
+	awaitingPeer   string   // sender: peer IP we're waiting on (empty when not awaiting)
+	sendCancelled  bool     // sender: set by CancelSend before it closes pendingOutConn
+
+	// Injected once at startup (before app.Run), read-only thereafter.
+	notifSvc   *notifications.NotificationService
+	showWindow func() // pops the tray panel to the front
+	catOnce    sync.Once
 }
 
 // cliExe returns the path to the blindspot CLI binary the tray shells out to. The
@@ -133,18 +166,31 @@ func (s *TrayService) GetStatus() Status {
 	}
 	s.mu.Lock()
 	busy, transfer, receiving, session := s.busy, s.transfer, s.receiver != nil, s.session
+	awaitingPeer := s.awaitingPeer
+	var incoming *IncomingRequest
+	if s.pendingIn != nil {
+		incoming = &IncomingRequest{
+			ID:       s.pendingIn.id,
+			PeerIP:   s.pendingIn.peerIP,
+			Filename: s.pendingIn.filename,
+			Size:     s.pendingIn.size,
+		}
+	}
 	s.mu.Unlock()
 	if !connected {
 		session = "" // a stale session name shouldn't outlive the connection
 	}
 	return Status{
-		Connected: connected,
-		MyIP:      s.MyIP(),
-		Session:   session,
-		Peers:     peers,
-		Busy:      busy,
-		Receiving: receiving,
-		Transfer:  transfer,
+		Connected:      connected,
+		MyIP:           s.MyIP(),
+		Session:        session,
+		Peers:          peers,
+		Busy:           busy,
+		Receiving:      receiving,
+		Transfer:       transfer,
+		AwaitingAccept: awaitingPeer != "",
+		AwaitingPeer:   awaitingPeer,
+		Incoming:       incoming,
 	}
 }
 
@@ -279,24 +325,89 @@ func (s *TrayService) SelectFile() (string, error) {
 	return path, nil
 }
 
-// SendFile sends a file to a peer in-process via the transfer package and returns the
-// final status line. Blocks for the duration of the transfer. A transfer failure (peer
-// not listening, mid-transfer error) is surfaced as the status line, matching the prior
-// behavior where the CLI reported such failures on stdout without a non-zero exit.
+// SendFile offers a file to a peer. It first asks the peer's control channel (:28126)
+// for consent; on accept it streams the file over :28125. If the peer has no control
+// listener (an older tray) it falls back to a direct send so mixed versions interoperate.
+// Blocks until the peer decides (or a timeout) and, on accept, for the transfer. A
+// failure is surfaced as the status line and returned with a nil error, matching the
+// prior behavior where transfer failures were reported without an exception.
 func (s *TrayService) SendFile(peerIP, filePath string) (string, error) {
 	peerIP = strings.TrimSpace(peerIP)
 	filePath = strings.TrimSpace(filePath)
 	if peerIP == "" || filePath == "" {
 		return "", fmt.Errorf("a peer IP and a file are both required")
 	}
-	if _, err := os.Stat(filePath); err != nil {
+	info, err := os.Stat(filePath)
+	if err != nil {
 		return "", fmt.Errorf("file not found: %s", filePath)
 	}
 
 	s.setBusy(true)
-	s.setTransfer(fmt.Sprintf("Sending %s to %s…", filepath.Base(filePath), peerIP))
 	defer s.setBusy(false)
 
+	// Ask for consent on the control channel first.
+	ctrl, err := net.DialTimeout("tcp", peerIP+requestPort, 5*time.Second)
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			// Peer is online but has no control listener (older tray). Fall back to a
+			// direct send so mixed versions keep working.
+			return s.directSend(peerIP, filePath)
+		}
+		// Timed out / unreachable — a direct dial would just burn another timeout.
+		return s.reportSend("Peer is offline."), nil
+	}
+
+	if err := writeRequestHeader(ctrl, filepath.Base(filePath), uint64(info.Size())); err != nil {
+		ctrl.Close()
+		return s.reportSend("Peer is unreachable."), nil
+	}
+
+	s.mu.Lock()
+	s.pendingOutConn = ctrl
+	s.sendCancelled = false
+	s.awaitingPeer = peerIP
+	s.transfer = fmt.Sprintf("Waiting for %s to accept…", peerIP)
+	s.mu.Unlock()
+	s.emit()
+
+	// Block on the 1-byte decision. The margin over requestTimeout lets the receiver's
+	// own timeout fire first, so we normally see an explicit decline rather than a read
+	// timeout.
+	ctrl.SetReadDeadline(time.Now().Add(requestTimeout + 5*time.Second))
+	buf := make([]byte, 1)
+	_, rerr := io.ReadFull(ctrl, buf)
+
+	// The await phase is over once the decision arrives (or the read fails). Clear it now,
+	// before any transfer, so the UI stops showing "waiting"/Cancel-send during the copy.
+	s.mu.Lock()
+	cancelled := s.sendCancelled
+	s.sendCancelled = false
+	s.pendingOutConn = nil
+	s.awaitingPeer = ""
+	s.mu.Unlock()
+	ctrl.Close()
+
+	switch {
+	case cancelled:
+		// User cancelled — clear silently.
+		s.setTransfer("")
+		return "", nil
+	case rerr != nil:
+		var ne net.Error
+		if errors.As(rerr, &ne) && ne.Timeout() {
+			return s.reportSend("Peer didn't respond."), nil
+		}
+		return s.reportSend("Peer is unreachable."), nil
+	case buf[0] != 1:
+		return s.reportSend("Peer declined the transfer."), nil
+	default:
+		return s.directSend(peerIP, filePath)
+	}
+}
+
+// directSend streams the file over the transfer port (:28125) and reports the outcome.
+func (s *TrayService) directSend(peerIP, filePath string) (string, error) {
+	s.setTransfer(fmt.Sprintf("Sending %s to %s…", filepath.Base(filePath), peerIP))
 	res, err := transfer.Send(context.Background(), peerIP, filePath, nil)
 	var last string
 	if err != nil {
@@ -311,6 +422,13 @@ func (s *TrayService) SendFile(peerIP, filePath string) (string, error) {
 	return last, nil
 }
 
+// reportSend sets a transient transfer status line and returns it.
+func (s *TrayService) reportSend(msg string) string {
+	s.setTransfer(msg)
+	s.clearTransferAfter(msg, 8*time.Second)
+	return msg
+}
+
 // StartReceive binds an in-process receive listener so the tray can keep serving while
 // it waits for an incoming file. Returning without error means the port is bound. A
 // goroutine runs the one-shot Accept, streaming progress into the transfer status and
@@ -323,7 +441,14 @@ func (s *TrayService) StartReceive(here bool) error {
 		return fmt.Errorf("already waiting to receive")
 	}
 	s.mu.Unlock()
+	return s.startReceiver(here)
+}
 
+// startReceiver binds an in-process receive listener and spawns the one-shot Accept
+// goroutine. It is shared by the manual StartReceive path and the consent-accept path
+// in requests.go. Returning without error means the port is bound (Listen guarantees
+// it), so a caller may signal readiness to a waiting sender immediately.
+func (s *TrayService) startReceiver(here bool) error {
 	ip := s.MyIP()
 	if ip == "" {
 		return fmt.Errorf("no identity found. Run 'blindspot connect' first")

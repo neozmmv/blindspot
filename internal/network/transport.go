@@ -78,7 +78,17 @@ type Transport struct {
 	bind    wgconn.Bind
 	recvFns []wgconn.ReceiveFunc
 	port    uint16
-	batch   int
+	// recvBatch is the number of datagrams one call to a receive function can
+	// return — the bind's own batch size.
+	recvBatch int
+	// batch is the pipeline batch size: rx queue sizing, consumer batches
+	// (ReadTunBatch), and send chunking. It is deliberately NOT tied to the
+	// bind's BatchSize: WinRingBind reports 1 (batching in and out of the RIO
+	// ring is an upstream TODO), which would otherwise disable the parallel
+	// seal/open and batched TUN writes entirely on Windows. Every bind's Send
+	// accepts arbitrarily long bufs slices, so sending IdealBatchSize-sized
+	// batches is always safe.
+	batch int
 }
 
 // OpenTransport opens the platform's default batched bind (RIO on Windows,
@@ -90,7 +100,12 @@ func OpenTransport() (*Transport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening UDP bind: %w", err)
 	}
-	return &Transport{bind: bind, recvFns: fns, port: port, batch: bind.BatchSize()}, nil
+	recvBatch := bind.BatchSize()
+	batch := wgconn.IdealBatchSize
+	if recvBatch > batch {
+		batch = recvBatch
+	}
+	return &Transport{bind: bind, recvFns: fns, port: port, recvBatch: recvBatch, batch: batch}, nil
 }
 
 // Port returns the local UDP port the transport is bound to.
@@ -103,10 +118,11 @@ func (t *Transport) Port() int { return int(t.port) }
 func WrapUDPConn(c *net.UDPConn) *Transport {
 	b := &udpBind{conn: c}
 	return &Transport{
-		bind:    b,
-		recvFns: []wgconn.ReceiveFunc{b.receive},
-		port:    uint16(c.LocalAddr().(*net.UDPAddr).Port),
-		batch:   b.BatchSize(),
+		bind:      b,
+		recvFns:   []wgconn.ReceiveFunc{b.receive},
+		port:      uint16(c.LocalAddr().(*net.UDPAddr).Port),
+		recvBatch: 1, // receive fills exactly one datagram per call
+		batch:     b.BatchSize(),
 	}
 }
 

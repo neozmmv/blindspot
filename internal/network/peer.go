@@ -75,6 +75,19 @@ type peerSession struct {
 	rxAEAD cipher.AEAD
 	txCtr  uint64 // next send counter (the AEAD nonce), guarded by mu
 
+	// lastRx is when the last packet that passed AEAD authentication and the
+	// replay window arrived from this peer. Guarded by mu. Any authenticated
+	// packet proves liveness, so the keepalive must not declare a peer dead
+	// while this is fresh — pongs alone are unreliable under congestion.
+	lastRx time.Time
+
+	// rekeyNotice is a prebuilt CtrlRekey packet sealed under the previous
+	// session keys. driveHandshake retransmits it until the new handshake
+	// establishes, so a peer that still holds the old session tears it down
+	// and re-handshakes instead of answering fresh msg1s with its stale
+	// cached msg2 (which deadlocks both sides until its keepalive times out).
+	rekeyNotice []byte
+
 	// Anti-replay window for the receive direction, guarded by mu like the rest
 	// of the session state and consulted only after AEAD authentication.
 	replay ReplayWindow
@@ -116,6 +129,7 @@ func (s *peerSession) installTransportKeysLocked(cs0, cs1 *noise.CipherState) er
 	}
 	s.txAEAD, s.rxAEAD = txAEAD, rxAEAD
 	s.txCtr = 0
+	s.rekeyNotice = nil
 	return nil
 }
 
@@ -144,6 +158,9 @@ func (s *peerSession) decrypt(dst []byte, pkt []byte) ([]byte, error) {
 	}
 	s.mu.Lock()
 	fresh := s.replay.Check(counter)
+	if fresh {
+		s.lastRx = time.Now()
+	}
 	s.mu.Unlock()
 	if !fresh {
 		return nil, fmt.Errorf("replayed or out-of-window packet from %s", s.addr)
@@ -162,8 +179,9 @@ type rxPacket struct {
 }
 
 type PeerConn struct {
-	bind  wgconn.Bind
-	batch int
+	bind      wgconn.Bind
+	batch     int // pipeline batch: rx queue, consumer batches, send chunking
+	recvBatch int // datagrams per receive-function call (the bind's own batch)
 
 	static   noise.DHKey
 	psk      []byte
@@ -205,6 +223,7 @@ func NewPeerConn(t *Transport, privateKey, publicKey, psk, prologue []byte) *Pee
 	p := &PeerConn{
 		bind:         t.bind,
 		batch:        t.batch,
+		recvBatch:    t.recvBatch,
 		static:       noise.DHKey{Private: privateKey, Public: publicKey},
 		psk:          psk,
 		prologue:     prologue,
@@ -268,9 +287,9 @@ func buildPacket(pktType byte, body []byte) []byte {
 // decrypts them in parallel.
 func (p *PeerConn) recvLoop(fn wgconn.ReceiveFunc) {
 	defer p.recvWG.Done()
-	bufs := make([][]byte, p.batch)
-	sizes := make([]int, p.batch)
-	eps := make([]wgconn.Endpoint, p.batch)
+	bufs := make([][]byte, p.recvBatch)
+	sizes := make([]int, p.recvBatch)
+	eps := make([]wgconn.Endpoint, p.recvBatch)
 	for i := range bufs {
 		bufs[i] = make([]byte, maxUDPPacket)
 	}
@@ -345,6 +364,16 @@ func (p *PeerConn) handlePacket(pkt []byte, ep wgconn.Endpoint) {
 			// Authenticated "I'm leaving" from the peer: drop its session and
 			// surface a Dead event — other peers are unaffected.
 			p.RemovePeer(s.addr)
+		case CtrlRekey:
+			// The peer lost this session (keepalive timeout on its side) and is
+			// re-handshaking. Drop our copy too — answering its fresh msg1 with
+			// the stale cached msg2 would deadlock both sides until our own
+			// keepalive timed out (~30s of blackout mid-transfer). No Dead event:
+			// mappings stay valid and the tunnel heals in one handshake round
+			// trip; watchRearm surfaces Dead only if the re-handshake never lands.
+			if gen, ok := p.rearmSession(s, false); ok {
+				go p.watchRearm(s, gen)
+			}
 		}
 	case PacketData, PacketTun:
 		s := p.sessionForEndpoint(ep)
@@ -486,6 +515,7 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 		established := s.established
 		initiator := s.initiator
 		initMsg := s.initMsg
+		notice := s.rekeyNotice
 		ep := s.ep
 		s.mu.Unlock()
 		if superseded || established {
@@ -493,6 +523,13 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return
+		}
+		if notice != nil {
+			// Rekey notice first, so a peer still holding the old session tears
+			// it down before our msg1 arrives. Retransmitting the same sealed
+			// packet is safe: once one copy is delivered, later copies fail the
+			// peer's replay window (or, after its rekey, the AEAD) and are dropped.
+			p.bind.Send([][]byte{notice}, ep)
 		}
 		if initiator && initMsg != nil {
 			p.bind.Send([][]byte{initMsg}, ep)
@@ -931,21 +968,36 @@ func (p *PeerConn) TimeoutPeer(addr *net.UDPAddr) {
 // as the pinned key for the next one. The retry is bounded by retryWindow; after
 // that the session is parked until an inbound msg1 or AddKnownPeer revives it.
 func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
-	s := p.sessionByAddr(addr)
-	if s == nil {
-		return
+	if s := p.sessionByAddr(addr); s != nil {
+		p.rearmSession(s, true)
 	}
+}
+
+// rearmSession resets an established session back to the handshake phase and
+// starts a bounded driver, returning the driver generation. With notify set, a
+// CtrlRekey notice sealed under the outgoing keys is prepared before they are
+// wiped; the driver retransmits it so the peer — which may still hold the old
+// session and would otherwise answer our fresh msg1 only with its stale cached
+// msg2 — tears its copy down and re-handshakes immediately.
+func (p *PeerConn) rearmSession(s *peerSession, notify bool) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.established || s.driving {
-		return
+		return 0, false
 	}
 	remote := s.remoteStatic
 	if remote == nil {
 		remote = s.expected
 	}
 	if remote == nil {
-		return
+		return 0, false
+	}
+	var notice []byte
+	if notify && s.txAEAD != nil {
+		pkt := sealPacket(s.txAEAD, PacketControl, s.txCtr, []byte{CtrlRekey})
+		s.txCtr++
+		notice = append([]byte(nil), pkt...)
+		putPacketBuf(pkt)
 	}
 	s.established = false
 	s.txAEAD, s.rxAEAD = nil, nil
@@ -954,9 +1006,42 @@ func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
 	s.replay = ReplayWindow{}
 	gen, err := p.armHandshakeLocked(s, remote)
 	if err != nil {
-		return
+		return 0, false
 	}
+	s.rekeyNotice = notice
 	go p.driveHandshake(s, gen, time.Now().Add(retryWindow))
+	return gen, true
+}
+
+// watchRearm fires Dead if a rekey-triggered re-handshake never completes
+// within the retry window. A CtrlRekey rearm deliberately emits no Dead event
+// (mappings stay valid for a fast heal), so a session that parks anyway must
+// still be surfaced to consumers or they would route into it forever.
+func (p *PeerConn) watchRearm(s *peerSession, gen uint64) {
+	select {
+	case <-p.stop:
+	case <-time.After(retryWindow + time.Second):
+		s.mu.Lock()
+		parked := !s.established && s.driverGen == gen
+		s.mu.Unlock()
+		if parked {
+			p.fireDead(s.addr)
+		}
+	}
+}
+
+// RecentActivity reports whether a packet that passed authentication and the
+// replay window arrived from addr within d. The keepalive uses it so a peer
+// whose data is flowing is never declared dead just because its pongs are
+// being lost to congestion.
+func (p *PeerConn) RecentActivity(addr *net.UDPAddr, d time.Duration) bool {
+	s := p.sessionByAddr(addr)
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.lastRx.IsZero() && time.Since(s.lastRx) < d
 }
 
 // establishedPeers returns the addresses of all currently established peers.

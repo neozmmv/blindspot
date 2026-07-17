@@ -355,6 +355,71 @@ func runConnectionTest(t *testing.T, sessionID, password string) {
 	_ = connectedOnB
 }
 
+// TestRekeyHealsAfterOneSidedTimeout covers the mid-transfer blackout bug: one
+// side declares the peer dead (keepalive timeout) and re-arms its handshake
+// while the other side still holds the established session. Without the
+// CtrlRekey notice the still-established side answers every fresh msg1 with its
+// stale cached msg2 and the two deadlock until the second side's own keepalive
+// times out (~30s). With the notice, both sides must re-establish within a few
+// seconds and pass traffic again.
+func TestRekeyHealsAfterOneSidedTimeout(t *testing.T) {
+	sessionID, password := "rekey-session", "pass1234!"
+
+	peerA := newTestPeer(t, sessionID, password)
+	defer peerA.conn.Close()
+	defer peerA.pc.Shutdown()
+
+	peerB := newTestPeer(t, sessionID, password)
+	defer peerB.conn.Close()
+	defer peerB.pc.Shutdown()
+
+	peerA.startReadLoop()
+	peerB.startReadLoop()
+
+	peerB.pc.AddKnownPeer(mustResolve(t, peerA.addr), peerA.kp.PublicKey)
+	peerA.pc.AddKnownPeer(mustResolve(t, peerB.addr), peerB.kp.PublicKey)
+
+	addrOnA := peerA.waitConnected(t, 5*time.Second)
+	peerB.waitConnected(t, 5*time.Second)
+
+	// Simulate a keepalive timeout on A only. B still believes the session is
+	// established and healthy.
+	peerA.pc.TimeoutPeer(addrOnA)
+	select {
+	case <-peerA.pc.Dead:
+	case <-time.After(3 * time.Second):
+		t.Fatal("TimeoutPeer did not surface a Dead event on A")
+	}
+
+	// Both sides must re-establish far faster than B's own 30s keepalive limit.
+	reconnectedOnA := peerA.waitConnected(t, 5*time.Second)
+	peerB.waitConnected(t, 5*time.Second)
+
+	// The healed session must carry traffic both ways.
+	if err := peerA.pc.Send(reconnectedOnA, []byte("post-rekey A->B")); err != nil {
+		t.Fatalf("send A->B after rekey: %v", err)
+	}
+	select {
+	case got := <-peerB.recv:
+		if string(got.data) != "post-rekey A->B" {
+			t.Fatalf("peer B received %q after rekey", got.data)
+		}
+		if err := peerB.pc.Send(got.addr, []byte("post-rekey B->A")); err != nil {
+			t.Fatalf("send B->A after rekey: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer B did not receive data after rekey")
+	}
+	select {
+	case got := <-peerA.recv:
+		if string(got.data) != "post-rekey B->A" {
+			t.Fatalf("peer A received %q after rekey", got.data)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer A did not receive data after rekey")
+	}
+}
+
 // TestConnectionNoPassword simulates `blindspot connect -s <session>` with two peers.
 func TestConnectionNoPassword(t *testing.T) {
 	runConnectionTest(t, "test-session", "")

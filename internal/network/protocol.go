@@ -52,8 +52,15 @@ const (
 
 // Inner control opcodes, carried as the plaintext of a PacketControl transport
 // packet (authenticated and anti-replay-protected like any other payload).
+//
+// CtrlRekey is sent (sealed under the keys being discarded) by a peer that is
+// resetting an established session back to the handshake phase, so the other
+// side drops its copy and re-handshakes immediately instead of answering the
+// fresh msg1 with a stale cached msg2. Peers that don't know the opcode simply
+// ignore it and heal via their own keepalive timeout, as before.
 const (
-	CtrlPing byte = 0x01
-	CtrlPong byte = 0x02
-	CtrlDead byte = 0x03
+	CtrlPing  byte = 0x01
+	CtrlPong  byte = 0x02
+	CtrlDead  byte = 0x03
+	CtrlRekey byte = 0x04
 )

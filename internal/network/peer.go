@@ -2,14 +2,20 @@ package network
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flynn/noise"
+	wgconn "golang.zx2c4.com/wireguard/conn"
 )
 
 const (
@@ -35,17 +41,17 @@ const (
 )
 
 // peerSession holds the per-peer handshake and transport state. All mutable
-// fields are guarded by mu; a CipherState is not safe for concurrent use.
+// fields are guarded by mu.
 type peerSession struct {
 	mu           sync.Mutex
-	addr         *net.UDPAddr
-	expected     []byte // static key the rendezvous published for this peer (nil until known)
-	remoteStatic []byte // authenticated static key after the handshake completes
+	addr         *net.UDPAddr    // canonical remote address, for events and the public API
+	key          string          // canonical addr string; the sessions-map key
+	ep           wgconn.Endpoint // bind endpoint used for all sends to this peer
+	expected     []byte          // static key the rendezvous published for this peer (nil until known)
+	remoteStatic []byte          // authenticated static key after the handshake completes
 	initiator    bool
 	hs           *noise.HandshakeState
-	tx           *noise.CipherState // our send cipher (per-direction, from Noise split)
-	rx           *noise.CipherState // our receive cipher
-	established bool
+	established  bool
 	// driving is true while a handshake is in flight (armed and not yet
 	// established). It is cleared the moment the session establishes — not when
 	// the retransmit goroutine notices and exits — so a re-arm cannot be blocked
@@ -57,19 +63,114 @@ type peerSession struct {
 	initMsg   []byte // initiator: cached msg1 packet, retransmitted until established
 	respMsg   []byte // responder: cached msg2 packet, retransmitted on duplicate msg1
 
+	// Transport crypto. At establishment the AES-256-GCM keys are extracted from
+	// the Noise CipherStates (UnsafeKey) and turned into stateless cipher.AEAD
+	// values: unlike a *noise.CipherState (whose implicit nonce makes every call
+	// order-dependent), a cipher.AEAD with an explicit nonce is safe for
+	// concurrent use — this is what lets a whole batch be sealed/opened in
+	// parallel across cores. The wire format is byte-identical to what the
+	// CipherStates produced: nonce = 4 zero bytes ‖ big-endian counter, AAD =
+	// the 10-byte cleartext header.
+	txAEAD cipher.AEAD
+	rxAEAD cipher.AEAD
+	txCtr  uint64 // next send counter (the AEAD nonce), guarded by mu
+
 	// Anti-replay window for the receive direction, guarded by mu like the rest
 	// of the session state and consulted only after AEAD authentication.
 	replay ReplayWindow
 }
 
+// aesgcmNonce builds the Noise-spec AESGCM nonce for counter n: 32 zero bits
+// followed by the 64-bit big-endian counter (matches flynn/noise exactly).
+func aesgcmNonce(n uint64) [12]byte {
+	var nonce [12]byte
+	binary.BigEndian.PutUint64(nonce[4:], n)
+	return nonce
+}
+
+// installTransportKeysLocked derives the per-direction AEADs from the Noise
+// split. The initiator sends with cs0 and receives with cs1; the responder the
+// reverse. Must be called with s.mu held, before established is set.
+func (s *peerSession) installTransportKeysLocked(cs0, cs1 *noise.CipherState) error {
+	txCS, rxCS := cs0, cs1
+	if !s.initiator {
+		txCS, rxCS = cs1, cs0
+	}
+	txKey := txCS.UnsafeKey()
+	rxKey := rxCS.UnsafeKey()
+	txBlock, err := aes.NewCipher(txKey[:])
+	if err != nil {
+		return err
+	}
+	txAEAD, err := cipher.NewGCM(txBlock)
+	if err != nil {
+		return err
+	}
+	rxBlock, err := aes.NewCipher(rxKey[:])
+	if err != nil {
+		return err
+	}
+	rxAEAD, err := cipher.NewGCM(rxBlock)
+	if err != nil {
+		return err
+	}
+	s.txAEAD, s.rxAEAD = txAEAD, rxAEAD
+	s.txCtr = 0
+	return nil
+}
+
+// decrypt authenticates and decrypts a full wire packet
+// [version][type][counter][ct], appending the plaintext to dst. The 10-byte
+// header is the AAD, so type and counter are authenticated; the anti-replay
+// window is consulted only after authentication, so a forged packet can never
+// advance it or punch a hole in it.
+func (s *peerSession) decrypt(dst []byte, pkt []byte) ([]byte, error) {
+	if len(pkt) < transportHeaderLen {
+		return nil, errors.New("transport packet too short")
+	}
+	header := pkt[:transportHeaderLen]
+	counter := binary.BigEndian.Uint64(pkt[2:transportHeaderLen])
+	s.mu.Lock()
+	aead := s.rxAEAD
+	established := s.established
+	s.mu.Unlock()
+	if !established || aead == nil {
+		return nil, fmt.Errorf("peer %s not established", s.addr)
+	}
+	nonce := aesgcmNonce(counter)
+	plaintext, err := aead.Open(dst, nonce[:], pkt[transportHeaderLen:], header)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	fresh := s.replay.Check(counter)
+	s.mu.Unlock()
+	if !fresh {
+		return nil, fmt.Errorf("replayed or out-of-window packet from %s", s.addr)
+	}
+	return plaintext, nil
+}
+
+// rxPacket is a still-encrypted data/tun wire packet queued between the
+// receive loops and the consumer (Read / ReadTunBatch). Decryption happens on
+// the consumer side so batches can be opened in parallel; buf is pooled and
+// owned by the consumer once dequeued.
+type rxPacket struct {
+	typ byte
+	s   *peerSession
+	buf []byte
+}
+
 type PeerConn struct {
-	conn     *net.UDPConn
+	bind  wgconn.Bind
+	batch int
+
 	static   noise.DHKey
 	psk      []byte
 	prologue []byte
 
 	mu           sync.Mutex
-	sessions     map[string]*peerSession // addr → session
+	sessions     map[string]*peerSession // canonical addr string → session
 	knownStatics map[string]bool         // hex(static) → allowed; the session allowlist from the rendezvous
 	missedPings  map[string]int          // addr → consecutive unanswered pings
 
@@ -78,18 +179,32 @@ type PeerConn struct {
 	stop      chan struct{}     // closed by Shutdown to stop background loops
 	stopOnce  sync.Once
 
-	// readBuf is the receive buffer reused across Read calls. Read is only ever
-	// called from a single reader goroutine; allocating 64 KB per packet would
-	// generate hundreds of MB/s of garbage at tunnel line rate.
-	readBuf []byte
+	// rx carries encrypted data/tun packets from the receive loops to the
+	// consumer. Sends block when it is full: backpressure ripples to the socket
+	// instead of silently dropping authenticated-to-be traffic.
+	rx chan rxPacket
+	// recvDone is closed when every receive loop has exited (bind closed), so
+	// consumers blocked in Read/ReadTunBatch wake up at teardown.
+	recvDone chan struct{}
+	recvWG   sync.WaitGroup
+
+	// stunWaiter, when set, receives copies of non-protocol packets so
+	// DiscoverPublicAddr can catch the STUN response on the tunnel socket.
+	stunWaiter atomic.Pointer[chan []byte]
+
+	// tunPkts/tunOK are ReadTunBatch scratch space (single consumer).
+	tunPkts []rxPacket
+	tunOK   []bool
 }
 
-// NewPeerConn creates a PeerConn. privateKey/publicKey are this peer's static
-// X25519 keypair; psk is the Argon2id-derived pre-shared key (second factor);
-// prologue binds the handshake to the protocol version and session id.
-func NewPeerConn(conn *net.UDPConn, privateKey, publicKey, psk, prologue []byte) *PeerConn {
-	return &PeerConn{
-		conn:         conn,
+// NewPeerConn creates a PeerConn on an opened Transport and starts its receive
+// loops. privateKey/publicKey are this peer's static X25519 keypair; psk is the
+// Argon2id-derived pre-shared key (second factor); prologue binds the handshake
+// to the protocol version and session id.
+func NewPeerConn(t *Transport, privateKey, publicKey, psk, prologue []byte) *PeerConn {
+	p := &PeerConn{
+		bind:         t.bind,
+		batch:        t.batch,
 		static:       noise.DHKey{Private: privateKey, Public: publicKey},
 		psk:          psk,
 		prologue:     prologue,
@@ -99,13 +214,35 @@ func NewPeerConn(conn *net.UDPConn, privateKey, publicKey, psk, prologue []byte)
 		Connected:    make(chan *net.UDPAddr, 32),
 		Dead:         make(chan *net.UDPAddr, 10),
 		stop:         make(chan struct{}),
+		rx:           make(chan rxPacket, 4*t.batch),
+		recvDone:     make(chan struct{}),
 	}
+	p.recvWG.Add(len(t.recvFns))
+	for _, fn := range t.recvFns {
+		go p.recvLoop(fn)
+	}
+	go func() {
+		p.recvWG.Wait()
+		close(p.recvDone)
+	}()
+	return p
 }
 
-// Shutdown signals background loops (handshake drivers) to stop. Safe to call
-// multiple times; it does not close the underlying UDP connection.
+// BatchSize is the number of packets a caller should size ReadTunBatch /
+// SendBatch batches to.
+func (p *PeerConn) BatchSize() int { return p.batch }
+
+// Shutdown signals background loops (handshake drivers, blocked consumers) to
+// stop. Safe to call multiple times; it does not close the underlying bind.
 func (p *PeerConn) Shutdown() {
 	p.stopOnce.Do(func() { close(p.stop) })
+}
+
+// Close shuts down background loops and closes the underlying bind, waking the
+// receive loops.
+func (p *PeerConn) Close() error {
+	p.Shutdown()
+	return p.bind.Close()
 }
 
 func staticKeyHex(pub []byte) string { return hex.EncodeToString(pub) }
@@ -125,6 +262,117 @@ func buildPacket(pktType byte, body []byte) []byte {
 	return pkt
 }
 
+// recvLoop services one of the bind's receive functions: batches of datagrams
+// come in, handshake/punch/control packets are handled inline (rare, small),
+// and data/tun packets are queued — still encrypted — for the consumer, which
+// decrypts them in parallel.
+func (p *PeerConn) recvLoop(fn wgconn.ReceiveFunc) {
+	defer p.recvWG.Done()
+	bufs := make([][]byte, p.batch)
+	sizes := make([]int, p.batch)
+	eps := make([]wgconn.Endpoint, p.batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, maxUDPPacket)
+	}
+	for {
+		n, err := fn(bufs, sizes, eps)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			select {
+			case <-p.stop:
+				return
+			default:
+				continue // transient receive error (e.g. ICMP-triggered reset)
+			}
+		}
+		for i := 0; i < n; i++ {
+			if sizes[i] == 0 {
+				continue
+			}
+			p.handlePacket(bufs[i][:sizes[i]], eps[i])
+		}
+	}
+}
+
+// handlePacket classifies one received datagram. pkt aliases the receive
+// buffer and is only valid for the duration of the call; anything that
+// outlives it (queued data/tun packets) is copied into a pooled buffer.
+func (p *PeerConn) handlePacket(pkt []byte, ep wgconn.Endpoint) {
+	// Every packet is [version][type][body...]. Drop anything too short or with a
+	// mismatched protocol version — no silent downgrade to an older protocol.
+	if len(pkt) < 2 || pkt[0] != ProtocolVersion {
+		// Not a blindspot packet. During public-address discovery the STUN
+		// response arrives on this same socket — hand it to the waiter.
+		if w := p.stunWaiter.Load(); w != nil {
+			cp := append([]byte(nil), pkt...)
+			select {
+			case *w <- cp:
+			default:
+			}
+		}
+		return
+	}
+	pktType := pkt[1]
+	body := pkt[2:]
+	switch pktType {
+	case PacketPunch:
+		return
+	case PacketHandshakeInit:
+		p.handleHandshakeInit(ep, body)
+	case PacketHandshakeResp:
+		p.handleHandshakeResp(ep, body)
+	case PacketControl:
+		s := p.sessionForEndpoint(ep)
+		if s == nil {
+			return
+		}
+		plaintext, err := s.decrypt(nil, pkt)
+		if err != nil || len(plaintext) < 1 {
+			return
+		}
+		switch plaintext[0] {
+		case CtrlPing:
+			UpdateLastSeen()
+			p.sendControl(s.addr, CtrlPong)
+		case CtrlPong:
+			UpdateLastSeen()
+			p.mu.Lock()
+			p.missedPings[s.key] = 0
+			p.mu.Unlock()
+		case CtrlDead:
+			// Authenticated "I'm leaving" from the peer: drop its session and
+			// surface a Dead event — other peers are unaffected.
+			p.RemovePeer(s.addr)
+		}
+	case PacketData, PacketTun:
+		s := p.sessionForEndpoint(ep)
+		if s == nil {
+			return
+		}
+		buf := getPacketBuf(len(pkt))
+		copy(buf, pkt)
+		select {
+		case p.rx <- rxPacket{typ: pktType, s: s, buf: buf}:
+		case <-p.stop:
+			putPacketBuf(buf)
+		}
+	}
+}
+
+// sessionForEndpoint resolves the session for a received packet's source.
+func (p *PeerConn) sessionForEndpoint(ep wgconn.Endpoint) *peerSession {
+	key, _, ok := canonEndpointKey(ep)
+	if !ok {
+		return nil
+	}
+	p.mu.Lock()
+	s := p.sessions[key]
+	p.mu.Unlock()
+	return s
+}
+
 // AddKnownPeer registers a peer learned from the trusted rendezvous: its UDP
 // address and its static public key (the pubkey the rendezvous published). The
 // key is added to the session allowlist, the local peer's handshake role is
@@ -139,12 +387,19 @@ func (p *PeerConn) AddKnownPeer(addr *net.UDPAddr, remoteStatic []byte) error {
 	key := make([]byte, 32)
 	copy(key, remoteStatic)
 
+	ap := canonAddrPort(addr.AddrPort())
+	sessKey := ap.String()
+	ep, err := p.bind.ParseEndpoint(sessKey)
+	if err != nil {
+		return fmt.Errorf("parsing peer endpoint %s: %w", sessKey, err)
+	}
+
 	p.mu.Lock()
 	p.knownStatics[staticKeyHex(key)] = true
-	s, ok := p.sessions[addr.String()]
+	s, ok := p.sessions[sessKey]
 	if !ok {
-		s = &peerSession{addr: addr}
-		p.sessions[addr.String()] = s
+		s = &peerSession{addr: net.UDPAddrFromAddrPort(ap), key: sessKey, ep: ep}
+		p.sessions[sessKey] = s
 	}
 	p.mu.Unlock()
 
@@ -231,6 +486,7 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 		established := s.established
 		initiator := s.initiator
 		initMsg := s.initMsg
+		ep := s.ep
 		s.mu.Unlock()
 		if superseded || established {
 			return
@@ -239,9 +495,9 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 			return
 		}
 		if initiator && initMsg != nil {
-			p.conn.WriteToUDP(initMsg, s.addr)
+			p.bind.Send([][]byte{initMsg}, ep)
 		} else {
-			p.conn.WriteToUDP(punch, s.addr)
+			p.bind.Send([][]byte{punch}, ep)
 		}
 		attempts++
 		if attempts >= handshakeAggressiveAttempts && interval < handshakeMaxInterval {
@@ -258,75 +514,151 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 	}
 }
 
-// Read returns the packet type, decrypted payload, sender address, and any error.
+// Read returns one decrypted packet: its type, payload, and sender address.
 // Callers filter on PacketData (chat) or PacketTun (VPN). Handshake, punch, and
-// keepalive packets are handled internally and never returned.
+// keepalive packets are handled internally and never returned. High-throughput
+// consumers should use ReadTunBatch instead.
 func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
-	if p.readBuf == nil {
-		p.readBuf = make([]byte, 65536)
-	}
-	buf := p.readBuf
 	for {
-		n, addr, err := p.conn.ReadFromUDP(buf)
-		if err != nil {
-			return 0, nil, nil, fmt.Errorf("error reading from peer: %w", err)
-		}
-		// Every packet is [version][type][body...]. Drop anything too short or with a
-		// mismatched protocol version — no silent downgrade to an older protocol.
-		if n < 2 || buf[0] != ProtocolVersion {
-			continue
-		}
-		pktType := buf[1]
-		body := buf[2:n]
-		switch pktType {
-		case PacketPunch:
-			continue
-		case PacketHandshakeInit:
-			p.handleHandshakeInit(addr, body)
-			continue
-		case PacketHandshakeResp:
-			p.handleHandshakeResp(addr, body)
-			continue
-		case PacketControl:
-			plaintext, err := p.openTransport(addr, buf[:n])
-			if err != nil || len(plaintext) < 1 {
-				continue
-			}
-			switch plaintext[0] {
-			case CtrlPing:
-				UpdateLastSeen()
-				p.sendControl(addr, CtrlPong)
-			case CtrlPong:
-				UpdateLastSeen()
-				p.mu.Lock()
-				p.missedPings[addr.String()] = 0
-				p.mu.Unlock()
-			case CtrlDead:
-				// Authenticated "I'm leaving" from the peer: drop its session, surface
-				// a Dead event, and keep reading — other peers are unaffected.
-				p.RemovePeer(addr)
-			}
-			continue
-		case PacketData, PacketTun:
-			plaintext, err := p.openTransport(addr, buf[:n])
+		select {
+		case pkt := <-p.rx:
+			plaintext, err := pkt.s.decrypt(nil, pkt.buf)
+			addr := pkt.s.addr
+			typ := pkt.typ
+			putPacketBuf(pkt.buf)
 			if err != nil {
 				continue
 			}
-			return pktType, plaintext, addr, nil
+			return typ, plaintext, addr, nil
+		case <-p.stop:
+			return 0, nil, nil, fmt.Errorf("error reading from peer: %w", net.ErrClosed)
+		case <-p.recvDone:
+			return 0, nil, nil, fmt.Errorf("error reading from peer: %w", net.ErrClosed)
 		}
 	}
 }
 
+// ReadTunBatch blocks for at least one tunnel packet, then drains whatever else
+// is immediately available (up to len(bufs)) and decrypts the whole batch in
+// parallel. Plaintexts land in bufs[:n] (slices are swapped/replaced as
+// needed); senders[:n] receives each packet's canonical remote address string,
+// suitable for keying reverse-path maps. Non-tun packets and packets that fail
+// authentication or replay checks are dropped. Not safe for concurrent use.
+func (p *PeerConn) ReadTunBatch(bufs [][]byte, senders []string) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	pkts := p.tunPkts[:0]
+
+	// Block for the first packet.
+	select {
+	case pkt := <-p.rx:
+		pkts = append(pkts, pkt)
+	case <-p.stop:
+		return 0, net.ErrClosed
+	case <-p.recvDone:
+		return 0, net.ErrClosed
+	}
+	// Opportunistically drain the rest of the burst.
+drain:
+	for len(pkts) < len(bufs) {
+		select {
+		case pkt := <-p.rx:
+			pkts = append(pkts, pkt)
+		default:
+			break drain
+		}
+	}
+
+	ok := p.tunOK[:0]
+	for range pkts {
+		ok = append(ok, false)
+	}
+	p.tunPkts, p.tunOK = pkts, ok // keep scratch capacity for the next call
+
+	parallelFor(len(pkts), func(i int) {
+		if pkts[i].typ != PacketTun {
+			return
+		}
+		plaintext, err := pkts[i].s.decrypt(bufs[i][:0], pkts[i].buf)
+		if err != nil {
+			return
+		}
+		bufs[i] = plaintext // may have been reallocated by Open; keep the header
+		ok[i] = true
+	})
+
+	n := 0
+	for i := range pkts {
+		putPacketBuf(pkts[i].buf)
+		if !ok[i] {
+			continue
+		}
+		if n != i {
+			bufs[n], bufs[i] = bufs[i], bufs[n]
+		}
+		senders[n] = pkts[i].s.key
+		n++
+	}
+	return n, nil
+}
+
+// parallelFor runs fn(0..n-1) across up to GOMAXPROCS goroutines, falling back
+// to a plain loop for small n where fork-join overhead would dominate.
+func parallelFor(n int, fn func(i int)) {
+	const minPerWorker = 8
+	workers := runtime.GOMAXPROCS(0)
+	if w := (n + minPerWorker - 1) / minPerWorker; w < workers {
+		workers = w
+	}
+	if workers <= 1 {
+		for i := 0; i < n; i++ {
+			fn(i)
+		}
+		return
+	}
+	chunk := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		hi := lo + chunk
+		if hi > n {
+			hi = n
+		}
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for i := lo; i < hi; i++ {
+				fn(i)
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
 // handleHandshakeInit processes an inbound Noise msg1 (we are the responder).
-func (p *PeerConn) handleHandshakeInit(addr *net.UDPAddr, msg1 []byte) {
+func (p *PeerConn) handleHandshakeInit(ep wgconn.Endpoint, msg1 []byte) {
+	sessKey, ap, okKey := canonEndpointKey(ep)
+	if !okKey {
+		return
+	}
 	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
+	s, ok := p.sessions[sessKey]
 	if !ok {
 		// A msg1 may arrive before the rendezvous stream told us about this peer.
 		// Create a provisional session; the initiator's static is still validated
-		// against the session allowlist below.
-		s = &peerSession{addr: addr}
-		p.sessions[addr.String()] = s
+		// against the session allowlist below. The endpoint is re-parsed rather
+		// than retained: received endpoints may alias bind-internal state.
+		pep, err := p.bind.ParseEndpoint(sessKey)
+		if err != nil {
+			p.mu.Unlock()
+			return
+		}
+		s = &peerSession{addr: net.UDPAddrFromAddrPort(ap), key: sessKey, ep: pep}
+		p.sessions[sessKey] = s
 	}
 	p.mu.Unlock()
 
@@ -334,9 +666,10 @@ func (p *PeerConn) handleHandshakeInit(addr *net.UDPAddr, msg1 []byte) {
 	if s.established {
 		// Retransmit our cached msg2 in case the initiator's copy was lost.
 		resp := s.respMsg
+		sendEp := s.ep
 		s.mu.Unlock()
 		if resp != nil {
-			p.conn.WriteToUDP(resp, addr)
+			p.bind.Send([][]byte{resp}, sendEp)
 		}
 		return
 	}
@@ -376,25 +709,27 @@ func (p *PeerConn) handleHandshakeInit(addr *net.UDPAddr, msg1 []byte) {
 		s.mu.Unlock()
 		return
 	}
-	// Responder: send with cs1 (responder→initiator), receive with cs0 (initiator→responder).
-	s.tx, s.rx = cs1, cs0
+	if err := s.installTransportKeysLocked(cs0, cs1); err != nil {
+		s.hs = nil
+		s.mu.Unlock()
+		return
+	}
 	s.remoteStatic = append([]byte(nil), remote...)
 	s.respMsg = buildPacket(PacketHandshakeResp, msg2)
 	s.established = true
 	s.driving = false // the retransmit driver will notice and exit; the session may be re-armed before then
 	resp := s.respMsg
+	sendEp := s.ep
 	s.mu.Unlock()
 
-	p.conn.WriteToUDP(resp, addr)
-	p.fireConnected(addr)
+	p.bind.Send([][]byte{resp}, sendEp)
+	p.fireConnected(s)
 }
 
 // handleHandshakeResp processes an inbound Noise msg2 (we are the initiator).
-func (p *PeerConn) handleHandshakeResp(addr *net.UDPAddr, msg2 []byte) {
-	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
-	p.mu.Unlock()
-	if !ok {
+func (p *PeerConn) handleHandshakeResp(ep wgconn.Endpoint, msg2 []byte) {
+	s := p.sessionForEndpoint(ep)
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
@@ -417,109 +752,116 @@ func (p *PeerConn) handleHandshakeResp(addr *net.UDPAddr, msg2 []byte) {
 		s.mu.Unlock()
 		return
 	}
-	// Initiator: send with cs0 (initiator→responder), receive with cs1 (responder→initiator).
-	s.tx, s.rx = cs0, cs1
+	if err := s.installTransportKeysLocked(cs0, cs1); err != nil {
+		s.mu.Unlock()
+		return
+	}
 	s.remoteStatic = append([]byte(nil), remote...)
 	s.established = true
 	s.driving = false // the retransmit driver will notice and exit; the session may be re-armed before then
 	s.mu.Unlock()
 
-	p.fireConnected(addr)
+	p.fireConnected(s)
 }
 
 // transportHeaderLen is the cleartext prefix [version][type][counter] that also
 // serves as the AEAD additional data.
 const transportHeaderLen = 2 + counterLen
 
-// openTransport authenticates and decrypts a transport packet
-// [version][type][counter][ct], enforcing the anti-replay window. The 10-byte
-// header is used as AAD, so the type and counter are authenticated.
-func (p *PeerConn) openTransport(addr *net.UDPAddr, pkt []byte) ([]byte, error) {
-	if len(pkt) < transportHeaderLen {
-		return nil, fmt.Errorf("transport packet too short")
-	}
-	header := pkt[:transportHeaderLen]
-	counter := binary.BigEndian.Uint64(pkt[2:transportHeaderLen])
-	ct := pkt[transportHeaderLen:]
-
-	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
-	p.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown peer: %s", addr)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.established || s.rx == nil {
-		return nil, fmt.Errorf("peer %s not established", addr)
-	}
-	// The counter is the AEAD nonce; using it directly lets us decrypt out of order.
-	s.rx.SetNonce(counter)
-	plaintext, err := s.rx.Decrypt(nil, header, ct)
-	if err != nil {
-		return nil, err
-	}
-	// Only after authentication do we consult the replay window, so a forged packet
-	// can never advance it or punch a hole in it.
-	if !s.replay.Check(counter) {
-		return nil, fmt.Errorf("replayed or out-of-window packet from %s", addr)
-	}
-	return plaintext, nil
+// sealPacket encrypts one payload into a pooled wire packet
+// [version][type][counter][ct]. The AEAD appends in place: the pooled buffer
+// is sized so Seal never reallocates.
+func sealPacket(aead cipher.AEAD, pktType byte, counter uint64, payload []byte) []byte {
+	buf := getPacketBuf(transportHeaderLen + len(payload) + 16)
+	buf[0] = ProtocolVersion
+	buf[1] = pktType
+	binary.BigEndian.PutUint64(buf[2:transportHeaderLen], counter)
+	nonce := aesgcmNonce(counter)
+	return aead.Seal(buf[:transportHeaderLen], nonce[:], payload, buf[:transportHeaderLen])
 }
 
-func (p *PeerConn) send(addr *net.UDPAddr, data []byte, pktType byte) error {
+func (p *PeerConn) sessionByAddr(addr *net.UDPAddr) *peerSession {
+	key := canonAddrPort(addr.AddrPort()).String()
 	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
+	s := p.sessions[key]
 	p.mu.Unlock()
-	if !ok {
+	return s
+}
+
+// SendBatch encrypts payloads in parallel and hands them to the bind as
+// batches, which coalesces them into far fewer syscalls (UDP GSO/sendmmsg on
+// Linux, RIO on Windows). Counters are reserved contiguously up front, so one
+// lock acquisition covers the whole batch.
+func (p *PeerConn) SendBatch(addr *net.UDPAddr, payloads [][]byte, pktType byte) error {
+	s := p.sessionByAddr(addr)
+	if s == nil {
 		return fmt.Errorf("unknown peer: %s", addr)
 	}
-	// Capacity covers header + ciphertext + AEAD tag so Encrypt's append never
-	// reallocates mid-packet.
-	header := make([]byte, transportHeaderLen, transportHeaderLen+len(data)+16)
-	header[0] = ProtocolVersion
-	header[1] = pktType
+	return p.sendBatchSession(s, payloads, pktType)
+}
 
+func (p *PeerConn) sendBatchSession(s *peerSession, payloads [][]byte, pktType byte) error {
+	m := len(payloads)
+	if m == 0 {
+		return nil
+	}
 	s.mu.Lock()
-	if !s.established || s.tx == nil {
+	if !s.established || s.txAEAD == nil {
 		s.mu.Unlock()
-		return fmt.Errorf("peer %s not established", addr)
+		return fmt.Errorf("peer %s not established", s.addr)
 	}
-	counter := s.tx.Nonce()
-	binary.BigEndian.PutUint64(header[2:], counter)
-	// AAD is the cleartext header (version, type, counter). Append the ciphertext
-	// after the header in a single buffer so the returned slice is the whole packet.
-	pkt, err := s.tx.Encrypt(header, header, data)
+	aead := s.txAEAD
+	ep := s.ep
+	base := s.txCtr
+	s.txCtr += uint64(m)
 	s.mu.Unlock()
-	if err != nil {
-		return err
+
+	wire := make([][]byte, m)
+	parallelFor(m, func(i int) {
+		wire[i] = sealPacket(aead, pktType, base+uint64(i), payloads[i])
+	})
+
+	var err error
+	for off := 0; off < m; off += p.batch {
+		end := off + p.batch
+		if end > m {
+			end = m
+		}
+		if e := p.bind.Send(wire[off:end], ep); e != nil && err == nil {
+			err = e
+		}
 	}
-	_, err = p.conn.WriteToUDP(pkt, addr)
+	for _, w := range wire {
+		putPacketBuf(w)
+	}
 	return err
 }
 
 // sendControl sends an encrypted control message (ping/pong/dead) over the same
 // authenticated, anti-replay-protected transport as data.
 func (p *PeerConn) sendControl(addr *net.UDPAddr, opcode byte) error {
-	return p.send(addr, []byte{opcode}, PacketControl)
+	return p.SendBatch(addr, [][]byte{{opcode}}, PacketControl)
 }
 
 func (p *PeerConn) Send(addr *net.UDPAddr, data []byte) error {
-	return p.send(addr, data, PacketData)
+	return p.SendBatch(addr, [][]byte{data}, PacketData)
 }
 
 func (p *PeerConn) SendTun(addr *net.UDPAddr, data []byte) error {
-	return p.send(addr, data, PacketTun)
+	return p.SendBatch(addr, [][]byte{data}, PacketTun)
+}
+
+// SendTunBatch sends a batch of tunnelled IP packets to one peer.
+func (p *PeerConn) SendTunBatch(addr *net.UDPAddr, packets [][]byte) error {
+	return p.SendBatch(addr, packets, PacketTun)
 }
 
 // PeerPublicKey returns the authenticated static public key of the established
 // peer at addr. The key is authenticated because it came from the trusted
 // rendezvous and was verified by the Noise handshake.
 func (p *PeerConn) PeerPublicKey(addr *net.UDPAddr) ([]byte, bool) {
-	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
-	p.mu.Unlock()
-	if !ok {
+	s := p.sessionByAddr(addr)
+	if s == nil {
 		return nil, false
 	}
 	s.mu.Lock()
@@ -530,24 +872,25 @@ func (p *PeerConn) PeerPublicKey(addr *net.UDPAddr) ([]byte, bool) {
 	return s.remoteStatic, true
 }
 
-func (p *PeerConn) fireConnected(addr *net.UDPAddr) {
+func (p *PeerConn) fireConnected(s *peerSession) {
 	p.mu.Lock()
-	p.missedPings[addr.String()] = 0
+	p.missedPings[s.key] = 0
 	p.mu.Unlock()
 	// Deliver reliably: block until the consumer takes the event, or until shutdown.
 	// Dropping it would leave the peer without a virtual-IP mapping, so all of its
 	// tunnel traffic would be silently discarded for the rest of the session. This
 	// runs after s.mu is released, so blocking here cannot deadlock a session.
 	select {
-	case p.Connected <- addr:
+	case p.Connected <- s.addr:
 	case <-p.stop:
 	}
 }
 
 func (p *PeerConn) dropSession(addr *net.UDPAddr) {
+	key := canonAddrPort(addr.AddrPort()).String()
 	p.mu.Lock()
-	delete(p.sessions, addr.String())
-	delete(p.missedPings, addr.String())
+	delete(p.sessions, key)
+	delete(p.missedPings, key)
 	p.mu.Unlock()
 }
 
@@ -575,8 +918,9 @@ func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
 // so the session heals on its own if the outage was transient (the peer never
 // told the rendezvous it left, so nothing else would ever reconnect the two).
 func (p *PeerConn) TimeoutPeer(addr *net.UDPAddr) {
+	key := canonAddrPort(addr.AddrPort()).String()
 	p.mu.Lock()
-	delete(p.missedPings, addr.String())
+	delete(p.missedPings, key)
 	p.mu.Unlock()
 	p.retryHandshake(addr)
 	p.fireDead(addr)
@@ -587,10 +931,8 @@ func (p *PeerConn) TimeoutPeer(addr *net.UDPAddr) {
 // as the pinned key for the next one. The retry is bounded by retryWindow; after
 // that the session is parked until an inbound msg1 or AddKnownPeer revives it.
 func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
-	p.mu.Lock()
-	s, ok := p.sessions[addr.String()]
-	p.mu.Unlock()
-	if !ok {
+	s := p.sessionByAddr(addr)
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
@@ -606,7 +948,8 @@ func (p *PeerConn) retryHandshake(addr *net.UDPAddr) {
 		return
 	}
 	s.established = false
-	s.tx, s.rx = nil, nil
+	s.txAEAD, s.rxAEAD = nil, nil
+	s.txCtr = 0
 	s.remoteStatic = nil
 	s.replay = ReplayWindow{}
 	gen, err := p.armHandshakeLocked(s, remote)

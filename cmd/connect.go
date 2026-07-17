@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -170,19 +171,27 @@ var ConnectCmd = &cobra.Command{
 			publicKey = keyPair.PublicKey
 		}
 
-		conn, publicAddr, err := network.OpenUDPConn()
+		// PSK (second factor) from the password via Argon2id, salted with the session
+		// id; prologue binds the Noise handshake to protocol version + session. Our
+		// static pubkey is published to the rendezvous so peers can pin it beforehand.
+		psk := crypto.DerivePSK(password, sessionId)
+		prologue := network.Prologue(sessionId)
+		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+
+		tr, err := network.OpenTransport()
 		if err != nil {
-			writeStatus("error: opening UDP connection: " + err.Error())
+			writeStatus("error: opening UDP transport: " + err.Error())
 			os.Remove(pidFile)
 			return
 		}
 
 		// from here on, defer owns all cleanup
 		var (
-			peerConn   *network.PeerConn
 			tunDevice  bstun.Device
 			registered bool
+			publicAddr string
 		)
+		peerConn := network.NewPeerConn(tr, privateKey, publicKey, psk, prologue)
 		quit := make(chan struct{})
 		var quitOnce sync.Once
 		closeQuit := func() { quitOnce.Do(func() { close(quit) }) }
@@ -195,22 +204,18 @@ var ConnectCmd = &cobra.Command{
 			if registered {
 				session.Leave(hostname, sessionId, password, publicAddr)
 			}
-			if peerConn != nil {
-				peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
-				peerConn.Shutdown()      // stop any in-flight handshake drivers
-			}
-			conn.Close()
+			peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
+			peerConn.Close()         // stop handshake drivers/consumers and close the bind
 			os.Remove(pidFile)
 			os.Remove(sessionStopFile())
 			os.Remove(peersFile())
 		}()
 
-		// PSK (second factor) from the password via Argon2id, salted with the session
-		// id; prologue binds the Noise handshake to protocol version + session. Our
-		// static pubkey is published to the rendezvous so peers can pin it beforehand.
-		psk := crypto.DerivePSK(password, sessionId)
-		prologue := network.Prologue(sessionId)
-		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
+		publicAddr, err = peerConn.DiscoverPublicAddr()
+		if err != nil {
+			writeStatus("error: discovering public address: " + err.Error())
+			return
+		}
 
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, isNew)
 		if err != nil {
@@ -227,7 +232,6 @@ var ConnectCmd = &cobra.Command{
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn = network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		// knownPeers tracks which resolved peer addresses have been handed to
 		// AddKnownPeer, so rendezvous announcements are not re-added while a session
@@ -329,42 +333,73 @@ var ConnectCmd = &cobra.Command{
 			}
 		}()
 
-		// UDP → TUN: decrypt incoming packets and write into the TUN interface
+		// tunBufPool recycles packet buffers across both pump directions so the
+		// steady state allocates nothing per packet.
+		tunBufPool := sync.Pool{New: func() any {
+			b := make([]byte, 1600)
+			return &b
+		}}
+		getTunBuf := func() []byte { return *tunBufPool.Get().(*[]byte) }
+		putTunBuf := func(b []byte) {
+			if cap(b) >= 1600 {
+				b = b[:1600]
+				tunBufPool.Put(&b)
+			}
+		}
+
+		// UDP → TUN: drain decrypted tunnel packets in batches (parallel AEAD in
+		// ReadTunBatch) and hand each surviving batch to the TUN device in a
+		// single Write call instead of one ring transition per packet.
 		go func() {
+			batch := peerConn.BatchSize()
+			bufs := make([][]byte, batch)
+			for i := range bufs {
+				bufs[i] = getTunBuf()
+			}
+			senders := make([]string, batch)
+			wr := make([][]byte, 0, batch)
 			for {
-				pktType, plaintext, addr, err := peerConn.Read()
+				n, err := peerConn.ReadTunBatch(bufs, senders)
 				if err != nil {
-					if strings.Contains(err.Error(), "use of closed network connection") {
-						return
+					return // transport closed
+				}
+				wr = wr[:0]
+				for i := 0; i < n; i++ {
+					// Reverse-path filter: the inner IPv4 source address must equal the
+					// sender's virtual IP. Otherwise a malicious member could inject packets
+					// spoofing another peer's virtual IP inside the (authenticated) tunnel.
+					expectedVIP, ok := addrToVIP.Load(senders[i])
+					if !ok || !bstun.SrcIPMatchesVirtualIP(bufs[i], expectedVIP.(string)) {
+						continue
 					}
-					continue
+					wr = append(wr, bufs[i])
 				}
-				if pktType != network.PacketTun {
-					continue
-				}
-				// Reverse-path filter: the inner IPv4 source address must equal the
-				// sender's virtual IP. Otherwise a malicious member could inject packets
-				// spoofing another peer's virtual IP inside the (authenticated) tunnel.
-				expectedVIP, ok := addrToVIP.Load(addr.String())
-				if !ok || !bstun.SrcIPMatchesVirtualIP(plaintext, expectedVIP.(string)) {
+				if len(wr) == 0 {
 					continue
 				}
 				network.UpdateLastSeen()
-				tunDevice.Write([][]byte{plaintext}, 0)
+				tunDevice.Write(wr, 0)
 			}
 		}()
 
-		// TUN → UDP: read outbound IP packets and route to the right peer
+		// TUN → UDP is split into a reader and a sender joined by a channel, so
+		// packets read one at a time (wintun's batch size is 1) still aggregate
+		// into batches for the encrypt+send path.
+		outCh := make(chan []byte, 512)
+
+		// Reader: pull outbound IP packets off the TUN device and hand their
+		// (pooled) buffers to the sender.
 		go func() {
 			batchSize := tunDevice.BatchSize()
 			bufs := make([][]byte, batchSize)
 			sizes := make([]int, batchSize)
 			for i := range bufs {
-				bufs[i] = make([]byte, 1500)
+				bufs[i] = getTunBuf()
 			}
 			for {
 				n, err := tunDevice.Read(bufs, sizes, 0)
 				if err != nil {
+					close(outCh)
 					return // TUN closed
 				}
 				for i := 0; i < n; i++ {
@@ -372,12 +407,65 @@ var ConnectCmd = &cobra.Command{
 					if len(packet) < 20 || packet[0]>>4 != 4 {
 						continue // not an IPv4 packet
 					}
-					destIP := net.IP(packet[16:20]).String()
+					select {
+					case outCh <- packet:
+						bufs[i] = getTunBuf() // buffer ownership moved to the sender
+					case <-quit:
+						return
+					}
+				}
+			}
+		}()
+
+		// Sender: aggregate whatever the reader has produced, group consecutive
+		// packets by destination peer, and push each group through one batched
+		// encrypt+send (one counter reservation, parallel AEAD, few syscalls).
+		go func() {
+			pending := make([][]byte, 0, 128)
+			flush := func() {
+				for start := 0; start < len(pending); {
+					destIP := net.IP(pending[start][16:20]).String()
 					addrVal, ok := virtualIPMap.Load(destIP)
 					if !ok {
-						continue // no peer with that virtual IP
+						putTunBuf(pending[start]) // no peer with that virtual IP
+						start++
+						continue
 					}
-					peerConn.SendTun(addrVal.(*net.UDPAddr), packet)
+					end := start + 1
+					for end < len(pending) && bytes.Equal(pending[end][16:20], pending[start][16:20]) {
+						end++
+					}
+					peerConn.SendTunBatch(addrVal.(*net.UDPAddr), pending[start:end])
+					for _, b := range pending[start:end] {
+						putTunBuf(b)
+					}
+					start = end
+				}
+				pending = pending[:0]
+			}
+			for {
+				select {
+				case pkt, ok := <-outCh:
+					if !ok {
+						return
+					}
+					pending = append(pending, pkt)
+				drain:
+					for len(pending) < cap(pending) {
+						select {
+						case more, ok := <-outCh:
+							if !ok {
+								flush()
+								return
+							}
+							pending = append(pending, more)
+						default:
+							break drain
+						}
+					}
+					flush()
+				case <-quit:
+					return
 				}
 			}
 		}()

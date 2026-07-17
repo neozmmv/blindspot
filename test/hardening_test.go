@@ -28,7 +28,7 @@ func deliverAndRead(t *testing.T, payload []byte) (panicVal any) {
 		t.Fatalf("GenerateKeyPair: %v", err)
 	}
 	psk := crypto.DerivePSK("hardening-pass", "hardening-session")
-	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey, psk, network.Prologue("hardening-session"))
+	pc := network.NewPeerConn(network.WrapUDPConn(conn), kp.PrivateKey, kp.PublicKey, psk, network.Prologue("hardening-session"))
 
 	var (
 		mu   sync.Mutex

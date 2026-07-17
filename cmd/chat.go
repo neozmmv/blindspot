@@ -51,34 +51,39 @@ var ChatCmd = &cobra.Command{
 			publicKey = keyPair.PublicKey
 		}
 
-		conn, publicAddr, err := network.OpenUDPConn()
-		if err != nil {
-			fmt.Println("Error opening UDP connection:", err)
-			return
-		}
-
-		fmt.Println("Public addr:", publicAddr)
-
 		// PSK second factor + Noise prologue, and our published static pubkey.
 		psk := crypto.DerivePSK(password, sessionId)
 		prologue := network.Prologue(sessionId)
 		myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
 
+		tr, err := network.OpenTransport()
+		if err != nil {
+			fmt.Println("Error opening UDP transport:", err)
+			return
+		}
+		peerConn := network.NewPeerConn(tr, privateKey, publicKey, psk, prologue)
+
+		publicAddr, err := peerConn.DiscoverPublicAddr()
+		if err != nil {
+			fmt.Println("Error discovering public address:", err)
+			peerConn.Close()
+			return
+		}
+		fmt.Println("Public addr:", publicAddr)
+
 		peers, err := session.Register(hostname, sessionId, password, publicAddr, myPubKeyB64, new)
 		if err != nil {
 			fmt.Printf("Error registering: %v\n", err)
-			conn.Close()
+			peerConn.Close()
 			return
 		}
 
 		myPublicIP := strings.Split(publicAddr, ":")[0]
-		peerConn := network.NewPeerConn(conn, privateKey, publicKey, psk, prologue)
 
 		defer func() {
 			session.Leave(hostname, sessionId, password, publicAddr)
 			peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
-			peerConn.Shutdown()      // stop any in-flight handshake drivers
-			conn.Close()
+			peerConn.Close()         // stop handshake drivers/consumers and close the bind
 		}()
 
 		// knownPeers tracks which resolved peer addresses have been handed to
@@ -227,7 +232,7 @@ var ChatCmd = &cobra.Command{
 
 		// watch connection
 		go func() {
-			if err := network.WatchConnection(conn, peerConn.HasPeers); err != nil {
+			if err := network.WatchConnection(peerConn.HasPeers); err != nil {
 				fmt.Println("Connection lost, exiting chat...")
 				close(quit)
 			}

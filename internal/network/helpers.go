@@ -59,6 +59,15 @@ func KeepAliveAll(p *PeerConn) {
 		case <-time.After(keepaliveInterval):
 		}
 		for _, addr := range p.establishedPeers() {
+			// Any authenticated packet proves the peer is alive. Under a heavy
+			// transfer the pong replies can be lost to congestion for long
+			// stretches; without this, a peer whose data is streaming in
+			// perfectly would be torn down mid-transfer.
+			if p.RecentActivity(addr, keepaliveInterval) {
+				p.mu.Lock()
+				p.missedPings[addr.String()] = 0
+				p.mu.Unlock()
+			}
 			p.mu.Lock()
 			missed := p.missedPings[addr.String()]
 			p.mu.Unlock()

@@ -2,7 +2,6 @@ package network
 
 import (
 	"fmt"
-	"net"
 	"sync"
 	"time"
 )
@@ -27,7 +26,7 @@ const (
 
 // WatchConnection monitors for activity. hasPeers returns true when there are
 // currently connected peers — the timeout only fires when peers exist but are silent.
-func WatchConnection(conn *net.UDPConn, hasPeers func() bool) error {
+func WatchConnection(hasPeers func() bool) error {
 	for {
 		time.Sleep(30 * time.Second)
 		if !hasPeers() {

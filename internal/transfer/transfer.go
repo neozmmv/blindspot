@@ -29,6 +29,25 @@ const dialTimeout = 5 * time.Second
 // sampleInterval is how often live progress snapshots are emitted during a transfer.
 const sampleInterval = 500 * time.Millisecond
 
+// copyBufSize is the userspace copy buffer for the file body. io.Copy's default
+// 32 KB means one write syscall per 32 KB; 1 MB cuts the syscall count ~32x on a
+// bulk transfer for a fixed, one-off allocation.
+//
+// Note: we deliberately do NOT call SetReadBuffer/SetWriteBuffer on the TCP
+// connection. A fixed SO_RCVBUF/SO_SNDBUF disables the OS's TCP window
+// autotuning, which on both Linux (tcp_rmem, up to ~6 MB) and Windows (receive
+// autotuning, up to 16 MB) already grows past anything we could safely pin —
+// and on Linux the fixed value would additionally be clamped to rmem_max
+// (~416 KB), a hard regression on high-BDP paths.
+const copyBufSize = 1 << 20
+
+// bodyReader hides any WriteTo/ReadFrom fast paths of the underlying reader so
+// io.CopyBuffer actually uses our large buffer instead of falling back to the
+// generic 32 KB path inside os.File.WriteTo.
+type bodyReader struct{ r io.Reader }
+
+func (br bodyReader) Read(p []byte) (int, error) { return br.r.Read(p) }
+
 // progressWriter is an io.Writer that counts the bytes passing through it, so a
 // background sampler can report progress without disturbing the copy.
 type progressWriter struct {
@@ -136,7 +155,7 @@ func Send(ctx context.Context, peer, path string, prog chan<- Progress) (*Result
 	pw := &progressWriter{w: conn}
 	stopSampler := startSampler(prog, pw, base)
 	start := time.Now()
-	n, err := io.Copy(pw, f)
+	n, err := io.CopyBuffer(pw, bodyReader{f}, make([]byte, copyBufSize))
 	stopSampler()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -236,7 +255,10 @@ func (r *Receiver) Accept(ctx context.Context, destDir string, prog chan<- Progr
 	pw := &progressWriter{w: f}
 	stopSampler := startSampler(prog, pw, base)
 	start := time.Now()
-	n, err := io.CopyN(pw, conn, int64(fileSize))
+	n, err := io.CopyBuffer(pw, bodyReader{io.LimitReader(conn, int64(fileSize))}, make([]byte, copyBufSize))
+	if err == nil && n < int64(fileSize) {
+		err = io.EOF // peer closed early; matches io.CopyN's short-read error
+	}
 	stopSampler()
 	if err != nil {
 		if ctx.Err() != nil {

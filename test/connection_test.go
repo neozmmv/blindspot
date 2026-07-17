@@ -209,7 +209,7 @@ func newTestPeerWithKey(t *testing.T, sessionID, password string, kp *crypto.Key
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", conn.LocalAddr().(*net.UDPAddr).Port)
 	psk := crypto.DerivePSK(password, sessionID)
-	pc := network.NewPeerConn(conn, kp.PrivateKey, kp.PublicKey, psk, network.Prologue(sessionID))
+	pc := network.NewPeerConn(network.WrapUDPConn(conn), kp.PrivateKey, kp.PublicKey, psk, network.Prologue(sessionID))
 	return &testPeer{
 		conn:   conn,
 		addr:   addr,

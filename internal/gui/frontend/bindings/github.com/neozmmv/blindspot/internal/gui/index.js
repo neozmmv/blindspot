@@ -8,6 +8,7 @@ export {
 };
 
 export {
+    IncomingRequest,
     Peer,
     Status
 } from "./models.js";

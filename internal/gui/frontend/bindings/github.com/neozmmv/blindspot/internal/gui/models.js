@@ -7,6 +7,59 @@
 import { Create as $Create } from "@wailsio/runtime";
 
 /**
+ * IncomingRequest is a pending inbound file offer surfaced to the frontend as an
+ * Accept/Decline card. It mirrors the native toast.
+ */
+export class IncomingRequest {
+    /**
+     * Creates a new IncomingRequest instance.
+     * @param {Partial<IncomingRequest>} [$$source = {}] - The source object to create the IncomingRequest.
+     */
+    constructor($$source = {}) {
+        if (!("id" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["id"] = "";
+        }
+        if (!("peerIP" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["peerIP"] = "";
+        }
+        if (!("filename" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["filename"] = "";
+        }
+        if (!("size" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["size"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new IncomingRequest instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {IncomingRequest}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new IncomingRequest(/** @type {Partial<IncomingRequest>} */($$parsedSource));
+    }
+}
+
+/**
  * Peer is one connected member of the active session.
  */
 export class Peer {
@@ -107,6 +160,31 @@ export class Status {
              */
             this["transfer"] = "";
         }
+        if (!("awaitingAccept" in $$source)) {
+            /**
+             * Consent handshake (see requests.go).
+             * sender: waiting for a peer to accept
+             * @member
+             * @type {boolean}
+             */
+            this["awaitingAccept"] = false;
+        }
+        if (!("awaitingPeer" in $$source)) {
+            /**
+             * sender: peer we're waiting on
+             * @member
+             * @type {string}
+             */
+            this["awaitingPeer"] = "";
+        }
+        if (!("incoming" in $$source)) {
+            /**
+             * receiver: pending inbound request, if any
+             * @member
+             * @type {IncomingRequest | null}
+             */
+            this["incoming"] = null;
+        }
 
         Object.assign(this, $$source);
     }
@@ -118,9 +196,13 @@ export class Status {
      */
     static createFrom($$source = {}) {
         const $$createField3_0 = $$createType1;
+        const $$createField9_0 = $$createType3;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("peers" in $$parsedSource) {
             $$parsedSource["peers"] = $$createField3_0($$parsedSource["peers"]);
+        }
+        if ("incoming" in $$parsedSource) {
+            $$parsedSource["incoming"] = $$createField9_0($$parsedSource["incoming"]);
         }
         return new Status(/** @type {Partial<Status>} */($$parsedSource));
     }
@@ -129,3 +211,5 @@ export class Status {
 // Private type creation functions
 const $$createType0 = Peer.createFrom;
 const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = IncomingRequest.createFrom;
+const $$createType3 = $Create.Nullable($$createType2);

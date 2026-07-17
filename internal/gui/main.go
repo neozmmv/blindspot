@@ -9,6 +9,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"github.com/wailsapp/wails/v3/pkg/icons"
+	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 )
 
 //go:embed all:frontend/dist
@@ -30,6 +31,9 @@ func init() {
 func Run() {
 	tray := &TrayService{}
 
+	// Native notification service for the tray↔tray file-consent prompts.
+	notifSvc := notifications.New()
+
 	// Declared up front so the SingleInstance callback below (and the tray menu) can
 	// close over them; assigned once the app exists. The tray is captured too so those
 	// paths open the panel anchored to the tray icon (ShowWindow) rather than letting
@@ -42,6 +46,7 @@ func Run() {
 		Description: "P2P Toolkit: VPN, File Sharing, Chat, and More",
 		Services: []application.Service{
 			application.NewService(tray),
+			application.NewService(notifSvc),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
@@ -65,19 +70,40 @@ func Run() {
 
 	systemTray = app.SystemTray.New()
 
+	// Wire the tray to notifications: it sends file-consent toasts, and a toast action
+	// (or a body click) routes back here. showWindow pops the panel anchored to the tray.
+	tray.notifSvc = notifSvc
+	tray.showWindow = systemTray.ShowWindow
+	notifSvc.OnNotificationResponse(func(result notifications.NotificationResult) {
+		if result.Error != nil {
+			return
+		}
+		switch result.Response.ActionIdentifier {
+		case actionAccept:
+			tray.AcceptRequest(result.Response.ID)
+		case actionDecline:
+			tray.DeclineRequest(result.Response.ID)
+		default:
+			// Body click (DEFAULT_ACTION): toast button callbacks aren't always
+			// delivered when the app isn't foregrounded, so land the user on the
+			// in-panel Accept/Decline card instead.
+			systemTray.ShowWindow()
+		}
+	})
+
 	// quitting flips true only when the user chooses Quit, so the close hook below
 	// knows to let the app actually terminate instead of just hiding the window.
 	quitting := false
 
 	window = app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "Blindspot",
-		Width:            400,
-		Height:           600,
-		Frameless:        true,
-		AlwaysOnTop:      true,
-		Hidden:           true,
-		DisableResize:    true,
-		HideOnEscape:     true,
+		Title:         "Blindspot",
+		Width:         400,
+		Height:        600,
+		Frameless:     true,
+		AlwaysOnTop:   true,
+		Hidden:        true,
+		DisableResize: true,
+		HideOnEscape:  true,
 		// Stay open when the user alt-tabs or clicks away — the panel only hides via
 		// the minimize button, Escape, the tray icon, or clicking outside is a no-op.
 		// It keeps AlwaysOnTop so it floats above other windows while visible.
@@ -154,6 +180,8 @@ func Run() {
 	// having to poll over the bindings.
 	go func() {
 		for {
+			// Keep the file-consent control listener bound while connected.
+			tray.ensureRequestListener()
 			app.Event.Emit("status", tray.GetStatus())
 			time.Sleep(2 * time.Second)
 		}

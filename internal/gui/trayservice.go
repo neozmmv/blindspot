@@ -1,9 +1,12 @@
 package gui
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 
+	"github.com/neozmmv/blindspot/internal/transfer"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
 )
@@ -36,25 +42,53 @@ type Peer struct {
 type Status struct {
 	Connected bool   `json:"connected"`
 	MyIP      string `json:"myIP"`
-	Session   string `json:"session"`   // active session name, if this tray started it
+	Session   string `json:"session"` // active session name, if this tray started it
 	Peers     []Peer `json:"peers"`
 	Busy      bool   `json:"busy"`      // a connect/send is in flight
 	Receiving bool   `json:"receiving"` // a receive listener is running
 	Transfer  string `json:"transfer"`  // latest file-transfer status line
+
+	// Consent handshake (see requests.go).
+	AwaitingAccept bool             `json:"awaitingAccept"` // sender: waiting for a peer to accept
+	AwaitingPeer   string           `json:"awaitingPeer"`   // sender: peer we're waiting on
+	Incoming       *IncomingRequest `json:"incoming"`       // receiver: pending inbound request, if any
 }
 
-// TrayService is the bridge exposed to the frontend. It wraps the same commands a
-// user would run in a terminal — shelling out to the blindspot binary for the
-// operations that need privilege elevation or long-running transfer logic
-// (connect / send / receive), and reading the on-disk session state directly for
-// everything else.
+// IncomingRequest is a pending inbound file offer surfaced to the frontend as an
+// Accept/Decline card. It mirrors the native toast.
+type IncomingRequest struct {
+	ID       string `json:"id"`
+	PeerIP   string `json:"peerIP"`
+	Filename string `json:"filename"`
+	Size     string `json:"size"`
+}
+
+// TrayService is the bridge exposed to the frontend. It shells out to the blindspot
+// binary for connect (which needs privilege elevation) and calls the in-process
+// internal/transfer package directly for file send/receive, while reading the on-disk
+// session state directly for status and disconnect.
 type TrayService struct {
-	mu            sync.Mutex
-	busy          bool
-	transfer      string
-	session       string    // the session name this tray connected to, if any
-	recvCmd       *exec.Cmd // running `receive` process, if any
-	recvCancelled bool      // set when the user stops the receive, so we clear rather than report
+	mu         sync.Mutex
+	busy       bool
+	transfer   string
+	session    string             // the session name this tray connected to, if any
+	receiver   *transfer.Receiver // in-process receive listener, while a receive is running
+	recvCancel context.CancelFunc // cancels the running receive
+
+	// Consent handshake state (see requests.go). All fields below are guarded by mu.
+	reqLn      net.Listener    // control-channel listener on myIP:28126 while connected
+	reqBoundIP string          // the IP reqLn is bound to (to detect a virtual-IP change)
+	pendingIn  *inboundRequest // at most one pending inbound request (single-flight)
+	reqCounter uint64          // monotonic source for request IDs
+
+	pendingOutConn net.Conn // sender: open control conn while awaiting a decision
+	awaitingPeer   string   // sender: peer IP we're waiting on (empty when not awaiting)
+	sendCancelled  bool     // sender: set by CancelSend before it closes pendingOutConn
+
+	// Injected once at startup (before app.Run), read-only thereafter.
+	notifSvc   *notifications.NotificationService
+	showWindow func() // pops the tray panel to the front
+	catOnce    sync.Once
 }
 
 // cliExe returns the path to the blindspot CLI binary the tray shells out to. The
@@ -131,19 +165,32 @@ func (s *TrayService) GetStatus() Status {
 		peers = []Peer{}
 	}
 	s.mu.Lock()
-	busy, transfer, receiving, session := s.busy, s.transfer, s.recvCmd != nil, s.session
+	busy, transfer, receiving, session := s.busy, s.transfer, s.receiver != nil, s.session
+	awaitingPeer := s.awaitingPeer
+	var incoming *IncomingRequest
+	if s.pendingIn != nil {
+		incoming = &IncomingRequest{
+			ID:       s.pendingIn.id,
+			PeerIP:   s.pendingIn.peerIP,
+			Filename: s.pendingIn.filename,
+			Size:     s.pendingIn.size,
+		}
+	}
 	s.mu.Unlock()
 	if !connected {
 		session = "" // a stale session name shouldn't outlive the connection
 	}
 	return Status{
-		Connected: connected,
-		MyIP:      s.MyIP(),
-		Session:   session,
-		Peers:     peers,
-		Busy:      busy,
-		Receiving: receiving,
-		Transfer:  transfer,
+		Connected:      connected,
+		MyIP:           s.MyIP(),
+		Session:        session,
+		Peers:          peers,
+		Busy:           busy,
+		Receiving:      receiving,
+		Transfer:       transfer,
+		AwaitingAccept: awaitingPeer != "",
+		AwaitingPeer:   awaitingPeer,
+		Incoming:       incoming,
 	}
 }
 
@@ -178,7 +225,7 @@ func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
 	go func() {
 		time.Sleep(d)
 		s.mu.Lock()
-		cleared := s.transfer == msg && s.recvCmd == nil
+		cleared := s.transfer == msg && s.receiver == nil
 		if cleared {
 			s.transfer = ""
 		}
@@ -189,10 +236,11 @@ func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
 	}()
 }
 
-// Connect runs `blindspot connect -s <session> -p <password> [-n]`, which triggers
-// the UAC elevation + daemon launch and blocks until the session is up (or fails).
-// It returns the final status line the CLI printed.
-func (s *TrayService) Connect(session, password string, isNew bool) (string, error) {
+// Connect runs `blindspot connect -s <session> -p <password> [-n] [-H <hostname>]`,
+// which triggers the UAC elevation + daemon launch and blocks until the session is
+// up (or fails). A non-empty hostname overrides the default rendezvous server. It
+// returns the final status line the CLI printed.
+func (s *TrayService) Connect(session, password string, isNew bool, hostname string) (string, error) {
 	session = strings.TrimSpace(session)
 	if session == "" {
 		return "", fmt.Errorf("session name is required")
@@ -210,6 +258,9 @@ func (s *TrayService) Connect(session, password string, isNew bool) (string, err
 	}
 	if isNew {
 		args = append(args, "-n")
+	}
+	if hostname = strings.TrimSpace(hostname); hostname != "" {
+		args = append(args, "-H", hostname)
 	}
 
 	s.setBusy(true)
@@ -274,91 +325,206 @@ func (s *TrayService) SelectFile() (string, error) {
 	return path, nil
 }
 
-// SendFile runs `blindspot send <peerIP> <filePath>` and returns the CLI's final
-// line. Blocks for the duration of the transfer.
+// SendFile offers a file to a peer. It first asks the peer's control channel (:28126)
+// for consent; on accept it streams the file over :28125. If the peer has no control
+// listener (an older tray) it falls back to a direct send so mixed versions interoperate.
+// Blocks until the peer decides (or a timeout) and, on accept, for the transfer. A
+// failure is surfaced as the status line and returned with a nil error, matching the
+// prior behavior where transfer failures were reported without an exception.
 func (s *TrayService) SendFile(peerIP, filePath string) (string, error) {
 	peerIP = strings.TrimSpace(peerIP)
 	filePath = strings.TrimSpace(filePath)
 	if peerIP == "" || filePath == "" {
 		return "", fmt.Errorf("a peer IP and a file are both required")
 	}
-	if _, err := os.Stat(filePath); err != nil {
+	info, err := os.Stat(filePath)
+	if err != nil {
 		return "", fmt.Errorf("file not found: %s", filePath)
 	}
 
 	s.setBusy(true)
-	s.setTransfer(fmt.Sprintf("Sending %s to %s…", filepath.Base(filePath), peerIP))
 	defer s.setBusy(false)
 
-	out, err := s.runCLI("send", peerIP, filePath)
-	last := lastLine(out)
+	// Ask for consent on the control channel first.
+	ctrl, err := net.DialTimeout("tcp", peerIP+requestPort, 5*time.Second)
 	if err != nil {
-		if last == "" {
-			last = "Send failed."
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			// Peer is online but has no control listener (older tray). Fall back to a
+			// direct send so mixed versions keep working.
+			return s.directSend(peerIP, filePath)
 		}
-		s.setTransfer(last)
-		s.clearTransferAfter(last, 8*time.Second)
-		return "", fmt.Errorf("%s", last)
+		// Timed out / unreachable — a direct dial would just burn another timeout.
+		return s.reportSend("Peer is offline."), nil
+	}
+
+	if err := writeRequestHeader(ctrl, filepath.Base(filePath), uint64(info.Size())); err != nil {
+		ctrl.Close()
+		return s.reportSend("Peer is unreachable."), nil
+	}
+
+	s.mu.Lock()
+	s.pendingOutConn = ctrl
+	s.sendCancelled = false
+	s.awaitingPeer = peerIP
+	s.transfer = fmt.Sprintf("Waiting for %s to accept…", peerIP)
+	s.mu.Unlock()
+	s.emit()
+
+	// Block on the 1-byte decision. The margin over requestTimeout lets the receiver's
+	// own timeout fire first, so we normally see an explicit decline rather than a read
+	// timeout.
+	ctrl.SetReadDeadline(time.Now().Add(requestTimeout + 5*time.Second))
+	buf := make([]byte, 1)
+	_, rerr := io.ReadFull(ctrl, buf)
+
+	// The await phase is over once the decision arrives (or the read fails). Clear it now,
+	// before any transfer, so the UI stops showing "waiting"/Cancel-send during the copy.
+	s.mu.Lock()
+	cancelled := s.sendCancelled
+	s.sendCancelled = false
+	s.pendingOutConn = nil
+	s.awaitingPeer = ""
+	s.mu.Unlock()
+	ctrl.Close()
+
+	switch {
+	case cancelled:
+		// User cancelled — clear silently.
+		s.setTransfer("")
+		return "", nil
+	case rerr != nil:
+		var ne net.Error
+		if errors.As(rerr, &ne) && ne.Timeout() {
+			return s.reportSend("Peer didn't respond."), nil
+		}
+		return s.reportSend("Peer is unreachable."), nil
+	case buf[0] != 1:
+		return s.reportSend("Peer declined the transfer."), nil
+	default:
+		return s.directSend(peerIP, filePath)
+	}
+}
+
+// directSend streams the file over the transfer port (:28125) and reports the outcome.
+func (s *TrayService) directSend(peerIP, filePath string) (string, error) {
+	s.setTransfer(fmt.Sprintf("Sending %s to %s…", filepath.Base(filePath), peerIP))
+	res, err := transfer.Send(context.Background(), peerIP, filePath, nil)
+	var last string
+	if err != nil {
+		last = err.Error()
+	} else {
+		last = fmt.Sprintf("Done — %s in %s (avg %s/s)",
+			transfer.FormatBytes(float64(res.Bytes)), res.Elapsed.Round(time.Millisecond),
+			transfer.FormatBytes(float64(res.Bytes)/res.Elapsed.Seconds()))
 	}
 	s.setTransfer(last)
 	s.clearTransferAfter(last, 8*time.Second)
 	return last, nil
 }
 
-// StartReceive launches `blindspot receive` in the background so the tray can keep
-// serving while it waits for an incoming file. Progress lines are streamed into the
-// transfer status and pushed to the frontend.
+// reportSend sets a transient transfer status line and returns it.
+func (s *TrayService) reportSend(msg string) string {
+	s.setTransfer(msg)
+	s.clearTransferAfter(msg, 8*time.Second)
+	return msg
+}
+
+// StartReceive binds an in-process receive listener so the tray can keep serving while
+// it waits for an incoming file. Returning without error means the port is bound. A
+// goroutine runs the one-shot Accept, streaming progress into the transfer status and
+// pushing it to the frontend; when it completes the receive state clears so a later
+// StartReceive rebinds cleanly.
 func (s *TrayService) StartReceive(here bool) error {
 	s.mu.Lock()
-	if s.recvCmd != nil {
+	if s.receiver != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("already waiting to receive")
 	}
+	s.mu.Unlock()
+	return s.startReceiver(here)
+}
 
-	args := []string{"receive"}
+// startReceiver binds an in-process receive listener and spawns the one-shot Accept
+// goroutine. It is shared by the manual StartReceive path and the consent-accept path
+// in requests.go. Returning without error means the port is bound (Listen guarantees
+// it), so a caller may signal readiness to a waiting sender immediately.
+func (s *TrayService) startReceiver(here bool) error {
+	ip := s.MyIP()
+	if ip == "" {
+		return fmt.Errorf("no identity found. Run 'blindspot connect' first")
+	}
+
+	var destDir string
+	var err error
 	if here {
-		args = append(args, "--here")
+		destDir, err = os.Getwd()
+	} else {
+		destDir, err = transfer.DownloadsDir()
 	}
-	cmd := exec.Command(cliExe(), args...)
-	hideConsole(cmd)
-	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		s.mu.Unlock()
 		return err
 	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	recv, err := transfer.Listen(ctx, ip)
+	if err != nil {
+		cancel()
 		return err
 	}
-	s.recvCmd = cmd
+
+	s.mu.Lock()
+	s.receiver = recv
+	s.recvCancel = cancel
 	s.transfer = "Waiting for a file…"
 	s.mu.Unlock()
 	s.emit()
 
-	// Stream the CLI output. It emits progress with carriage returns, so split on
-	// both \r and \n and surface the most recent non-empty line.
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Split(scanLinesOrCR)
-		for scanner.Scan() {
-			if line := strings.TrimSpace(scanner.Text()); line != "" {
-				s.setTransfer(line)
+		defer cancel()
+
+		// Render progress snapshots into the transfer status: the first snapshot is the
+		// "Receiving…" header, later ones overwrite a single live line.
+		prog := make(chan transfer.Progress, 1)
+		renderDone := make(chan struct{})
+		go func() {
+			var lr transfer.LineRenderer
+			first := true
+			for p := range prog {
+				if first {
+					first = false
+					lr.Seed(p)
+					s.setTransfer(fmt.Sprintf("Receiving %s (%d MB) from %s...", p.Name, p.Total/(1024*1024), p.PeerAddr))
+					continue
+				}
+				s.setTransfer(strings.TrimSpace(lr.Line(p)))
 			}
-		}
-		_ = scanner.Err()
-		cmd.Wait()
+			close(renderDone)
+		}()
+
+		res, err := recv.Accept(ctx, destDir, prog)
+		close(prog)
+		<-renderDone
+		recv.Close()
+
 		s.mu.Lock()
-		s.recvCmd = nil
-		cancelled := s.recvCancelled
-		s.recvCancelled = false
-		result := s.transfer
-		// A user stop, or ending while still just waiting, leaves no useful result —
-		// clear the line so it doesn't linger. A real outcome (file saved, or an
-		// error mid-transfer) stays briefly, then auto-clears below.
-		if cancelled || strings.HasPrefix(result, "Waiting") {
+		s.receiver = nil
+		s.recvCancel = nil
+		var result string
+		switch {
+		case errors.Is(err, context.Canceled):
+			// User stopped the receive — clear rather than report.
 			s.transfer = ""
-			result = ""
+		case err != nil && strings.HasPrefix(s.transfer, "Waiting"):
+			// Failed before any file arrived — nothing useful to show.
+			s.transfer = ""
+		case err != nil:
+			result = err.Error()
+			s.transfer = result
+		default:
+			result = fmt.Sprintf("Saved to %s — %s in %s (avg %s/s)",
+				res.Path, transfer.FormatBytes(float64(res.Bytes)), res.Elapsed.Round(time.Millisecond),
+				transfer.FormatBytes(float64(res.Bytes)/res.Elapsed.Seconds()))
+			s.transfer = result
 		}
 		s.mu.Unlock()
 		s.emit()
@@ -367,18 +533,16 @@ func (s *TrayService) StartReceive(here bool) error {
 	return nil
 }
 
-// CancelReceive kills a pending `receive` process, if one is running.
+// CancelReceive cancels a pending receive, if one is running. Cancelling the context
+// unblocks the in-process Accept, whose goroutine then clears the receive state.
 func (s *TrayService) CancelReceive() error {
 	s.mu.Lock()
-	cmd := s.recvCmd
-	if cmd != nil {
-		s.recvCancelled = true
-	}
+	cancel := s.recvCancel
 	s.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
-		return nil
+	if cancel != nil {
+		cancel()
 	}
-	return cmd.Process.Kill()
+	return nil
 }
 
 // Version returns the blindspot version string.
@@ -407,21 +571,4 @@ func lastLine(s string) string {
 		}
 	}
 	return ""
-}
-
-// scanLinesOrCR is a bufio.SplitFunc that breaks tokens on either newline or
-// carriage return, so progress-bar updates (which use \r) surface as they arrive.
-func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	for i, b := range data {
-		if b == '\n' || b == '\r' {
-			return i + 1, data[:i], nil
-		}
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }

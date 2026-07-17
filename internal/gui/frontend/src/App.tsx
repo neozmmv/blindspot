@@ -7,6 +7,13 @@ interface Peer {
   publicAddr: string
 }
 
+interface IncomingRequest {
+  id: string
+  peerIP: string
+  filename: string
+  size: string
+}
+
 interface Status {
   connected: boolean
   myIP: string
@@ -15,6 +22,9 @@ interface Status {
   busy: boolean
   receiving: boolean
   transfer: string
+  awaitingAccept: boolean
+  awaitingPeer: string
+  incoming: IncomingRequest | null
 }
 
 const emptyStatus: Status = {
@@ -25,6 +35,9 @@ const emptyStatus: Status = {
   busy: false,
   receiving: false,
   transfer: '',
+  awaitingAccept: false,
+  awaitingPeer: '',
+  incoming: null,
 }
 
 /* Minimal line icons, sized by the surrounding font. */
@@ -63,6 +76,8 @@ function App() {
   const [session, setSession] = useState('')
   const [password, setPassword] = useState('')
   const [isNew, setIsNew] = useState(false)
+  const [useCustomRendezvous, setUseCustomRendezvous] = useState(false)
+  const [hostname, setHostname] = useState('')
   const [copied, setCopied] = useState(false)
   const [copiedPeer, setCopiedPeer] = useState('')
   const [version, setVersion] = useState('')
@@ -103,7 +118,8 @@ function App() {
   const doConnect = async () => {
     setNotice('')
     try {
-      const msg = await TrayService.Connect(session, password, isNew)
+      const rendezvous = useCustomRendezvous ? hostname : ''
+      const msg = await TrayService.Connect(session, password, isNew, rendezvous)
       flash(msg || 'Connected.')
       setPassword('')
     } catch (e: any) {
@@ -150,6 +166,16 @@ function App() {
     try { await TrayService.CancelReceive() } catch { /* ignore */ }
   }
 
+  const acceptRequest = async (id: string) => {
+    try { await TrayService.AcceptRequest(id) } catch { /* ignore */ }
+  }
+  const declineRequest = async (id: string) => {
+    try { await TrayService.DeclineRequest(id) } catch { /* ignore */ }
+  }
+  const cancelSend = async () => {
+    try { await TrayService.CancelSend() } catch { /* ignore */ }
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -178,6 +204,20 @@ function App() {
               <span className="meta-dim">{status.peers.length} {status.peers.length === 1 ? 'peer' : 'peers'} connected</span>
             </div>
           </section>
+
+          {status.incoming && (
+            <section className="card request-card">
+              <div className="request-title"><IconDownload /> Incoming file</div>
+              <p className="request-body">
+                <strong>{status.incoming.peerIP}</strong> wants to send you{' '}
+                <strong>{status.incoming.filename}</strong> <span className="request-size">({status.incoming.size})</span>
+              </p>
+              <div className="request-actions">
+                <button className="btn btn-primary" onClick={() => acceptRequest(status.incoming!.id)}>Accept</button>
+                <button className="btn btn-secondary" onClick={() => declineRequest(status.incoming!.id)}>Decline</button>
+              </div>
+            </section>
+          )}
 
           <section className="peers-block">
             <div className="section-title">
@@ -229,6 +269,9 @@ function App() {
             <div className="transfer">
               <span className="transfer-spinner" />
               <span className="transfer-text">{status.transfer}</span>
+              {status.awaitingAccept && (
+                <button className="transfer-cancel" onClick={cancelSend}>Cancel</button>
+              )}
             </div>
           )}
 
@@ -255,7 +298,7 @@ function App() {
             <input
               id="session"
               className="input"
-              placeholder="e.g. home-office"
+              placeholder="e.g. blindspot-friends"
               value={session}
               onChange={(e) => setSession(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
@@ -279,6 +322,27 @@ function App() {
               <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
               <span>Create a new encrypted network</span>
             </label>
+
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={useCustomRendezvous}
+                onChange={(e) => setUseCustomRendezvous(e.target.checked)}
+              />
+              <span>Use a custom rendezvous server</span>
+            </label>
+
+            {useCustomRendezvous && (
+              <input
+                id="hostname"
+                className="input"
+                placeholder="e.g. rendezvous.trycloudflare.com"
+                value={hostname}
+                onChange={(e) => setHostname(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
+                autoComplete="off"
+              />
+            )}
 
             <button className="btn btn-primary btn-full" onClick={doConnect} disabled={status.busy || !session}>
               {status.busy ? 'Connecting…' : 'Connect'}

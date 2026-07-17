@@ -79,6 +79,14 @@ var updateWindowsCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Update blindspot (CLI and tray)",
 	Run: func(cmd *cobra.Command, args []string) {
+		// A running session keeps blindspot.exe open, so Windows can't overwrite it
+		// during the update (the move fails with the file in use). Tell the user to
+		// disconnect first, in red, and bail out before attempting anything.
+		if isSessionRunning() {
+			fmt.Printf("\033[31mYou are connected to a blindspot network. Disconnect before updating (run: blindspot disconnect).\033[0m\n")
+			os.Exit(1)
+		}
+
 		exe, err := os.Executable()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Could not locate the blindspot executable: %v\n", err)

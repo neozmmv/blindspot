@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -75,6 +76,19 @@ var ConnectCmd = &cobra.Command{
 		daemon, _ := cmd.Flags().GetBool("daemon")
 		statusFile, _ := cmd.Flags().GetString("status-file")
 		insecure, _ := cmd.Flags().GetBool("insecure")
+		// Upload cap precedence: --up-mbit flag > BLINDSPOT_UP_MBIT env >
+		// persistent config ('blindspot config up-mbit N'). The config file is
+		// what the tray path uses — it shells out to connect without flags, and
+		// the UAC-elevated daemon shares the same ~/.blindspot.
+		upMbit, _ := cmd.Flags().GetInt("up-mbit")
+		if upMbit == 0 {
+			if v, err := strconv.Atoi(os.Getenv("BLINDSPOT_UP_MBIT")); err == nil && v > 0 {
+				upMbit = v
+			}
+		}
+		if upMbit == 0 {
+			upMbit = utils.LoadConfig().UpMbit
+		}
 
 		if len(password) < 8 && isNew {
 			fmt.Println("Password must be at least 8 characters long")
@@ -192,6 +206,9 @@ var ConnectCmd = &cobra.Command{
 			publicAddr string
 		)
 		peerConn := network.NewPeerConn(tr, privateKey, publicKey, psk, prologue)
+		if upMbit > 0 {
+			peerConn.SetFixedUploadRate(float64(upMbit) * 1e6 / 8)
+		}
 		quit := make(chan struct{})
 		var quitOnce sync.Once
 		closeQuit := func() { quitOnce.Do(func() { close(quit) }) }
@@ -333,6 +350,62 @@ var ConnectCmd = &cobra.Command{
 			}
 		}()
 
+		// TUN-side counters for the stats log: what enters from the OS, what is
+		// written back to the OS, and what the reverse-path filter rejects.
+		var tunInPkts, tunInBytes, tunOutPkts, tunOutBytes, rpfDrops, noPeerDrops atomic.Uint64
+
+		// Stats logger: once per second, append a delta line to stats.log while
+		// there is tunnel activity. Comparing this file across the two machines
+		// shows exactly where packets die: sender tx vs receiver rx is path
+		// loss; rx vs tun_out is local processing loss; dec_fail/replay/rekey
+		// indicate session-level trouble.
+		go func() {
+			logPath := filepath.Join(utils.GetBlindspotDir(), "stats.log")
+			f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if err != nil {
+				return
+			}
+			defer f.Close()
+			type snap struct {
+				txP, txB, txE, rxP, rxB, dec, rep, rek, tmo uint64
+				tiP, tiB, toP, toB, rpf, nop                uint64
+			}
+			take := func() snap {
+				s := &network.Stats
+				return snap{
+					s.TxPkts.Load(), s.TxBytes.Load(), s.TxErrs.Load(),
+					s.RxPkts.Load(), s.RxBytes.Load(),
+					s.RxDecryptFail.Load(), s.RxReplayDrop.Load(),
+					s.Rekeys.Load(), s.Timeouts.Load(),
+					tunInPkts.Load(), tunInBytes.Load(),
+					tunOutPkts.Load(), tunOutBytes.Load(),
+					rpfDrops.Load(), noPeerDrops.Load(),
+				}
+			}
+			prev := take()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-quit:
+					return
+				case <-ticker.C:
+					cur := take()
+					if cur == prev {
+						continue
+					}
+					fmt.Fprintf(f,
+						"%s tun_in=%d/%dB tx=%d/%dB txerr=%d | rx=%d/%dB tun_out=%d/%dB dec_fail=%d replay=%d rpf=%d nopeer=%d | rekey=%d timeout=%d pace=%dbps\n",
+						time.Now().Format("15:04:05"),
+						cur.tiP-prev.tiP, cur.tiB-prev.tiB, cur.txP-prev.txP, cur.txB-prev.txB, cur.txE-prev.txE,
+						cur.rxP-prev.rxP, cur.rxB-prev.rxB, cur.toP-prev.toP, cur.toB-prev.toB,
+						cur.dec-prev.dec, cur.rep-prev.rep, cur.rpf-prev.rpf, cur.nop-prev.nop,
+						cur.rek-prev.rek, cur.tmo-prev.tmo, network.Stats.PaceBps.Load()*8)
+					prev = cur
+				}
+			}
+		}()
+
 		// tunBufPool recycles packet buffers across both pump directions so the
 		// steady state allocates nothing per packet.
 		tunBufPool := sync.Pool{New: func() any {
@@ -370,9 +443,12 @@ var ConnectCmd = &cobra.Command{
 					// spoofing another peer's virtual IP inside the (authenticated) tunnel.
 					expectedVIP, ok := addrToVIP.Load(senders[i])
 					if !ok || !bstun.SrcIPMatchesVirtualIP(bufs[i], expectedVIP.(string)) {
+						rpfDrops.Add(1)
 						continue
 					}
 					wr = append(wr, bufs[i])
+					tunOutPkts.Add(1)
+					tunOutBytes.Add(uint64(len(bufs[i])))
 				}
 				if len(wr) == 0 {
 					continue
@@ -407,6 +483,8 @@ var ConnectCmd = &cobra.Command{
 					if len(packet) < 20 || packet[0]>>4 != 4 {
 						continue // not an IPv4 packet
 					}
+					tunInPkts.Add(1)
+					tunInBytes.Add(uint64(len(packet)))
 					select {
 					case outCh <- packet:
 						bufs[i] = getTunBuf() // buffer ownership moved to the sender
@@ -420,6 +498,9 @@ var ConnectCmd = &cobra.Command{
 		// Sender: aggregate whatever the reader has produced, group consecutive
 		// packets by destination peer, and push each group through one batched
 		// encrypt+send (one counter reservation, parallel AEAD, few syscalls).
+		// Upload shaping happens inside SendTunBatch: adaptive by default
+		// (engages only when CtrlAck feedback shows path loss), or fixed when
+		// --up-mbit / config override it.
 		go func() {
 			pending := make([][]byte, 0, 128)
 			flush := func() {
@@ -427,6 +508,7 @@ var ConnectCmd = &cobra.Command{
 					destIP := net.IP(pending[start][16:20]).String()
 					addrVal, ok := virtualIPMap.Load(destIP)
 					if !ok {
+						noPeerDrops.Add(1)
 						putTunBuf(pending[start]) // no peer with that virtual IP
 						start++
 						continue
@@ -524,6 +606,7 @@ func init() {
 	ConnectCmd.Flags().StringP("password", "p", "", "Session password")
 	ConnectCmd.Flags().BoolP("new", "n", false, "Create new session with password")
 	ConnectCmd.Flags().Bool("insecure", false, "Allow a plaintext http:// rendezvous (NOT recommended)")
+	ConnectCmd.Flags().Int("up-mbit", 0, "Force a fixed upload cap in Mbit/s (0 = automatic: adapts to the path)")
 	ConnectCmd.MarkFlagRequired("session")
 	ConnectCmd.Flags().Bool("daemon", false, "")
 	ConnectCmd.Flags().String("status-file", "", "")

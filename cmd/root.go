@@ -27,6 +27,7 @@ func init() {
 	rootCmd.AddCommand(SendCmd)
 	rootCmd.AddCommand(ReceiveCmd)
 	rootCmd.AddCommand(IdentityCmd)
+	rootCmd.AddCommand(ConfigCmd)
 	rootCmd.AddCommand(VersionCmd)
 }
 

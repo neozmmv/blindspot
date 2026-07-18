@@ -58,9 +58,17 @@ const (
 // side drops its copy and re-handshakes immediately instead of answering the
 // fresh msg1 with a stale cached msg2. Peers that don't know the opcode simply
 // ignore it and heal via their own keepalive timeout, as before.
+// CtrlAck is the delivery report driving the adaptive upload shaper: the
+// receiver periodically reports the highest transport counter it has seen and
+// the total packets it accepted, both cumulative for the session. From the
+// deltas the sender measures true path loss (counter gaps have no in-flight
+// bias — a gap means the packet was overtaken or lost) and shapes its send
+// rate to the path. Payload: [opcode][maxCounter:8][accepted:8]. Peers that
+// don't know the opcode ignore it, leaving the sender uncapped (old behavior).
 const (
 	CtrlPing  byte = 0x01
 	CtrlPong  byte = 0x02
 	CtrlDead  byte = 0x03
 	CtrlRekey byte = 0x04
+	CtrlAck   byte = 0x05
 )

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"runtime"
 	"sync"
@@ -38,6 +39,41 @@ const (
 	// decrypted out of order and after loss (UDP reorders and drops freely), unlike
 	// Noise's implicit in-order nonce.
 	counterLen = 8
+)
+
+// Adaptive upload shaping. A TCP flow inside the tunnel cannot sense the real
+// bottleneck (the tunnel emits UDP at local line rate), so without shaping its
+// growing window is fired as salvos that overflow the bottleneck queue in one
+// go — burst loss TCP reads as a timeout, collapsing throughput. The shaper
+// stays fully uncapped until CtrlAck feedback shows real path loss, then
+// engages at the observed send rate and AIMD-tracks the path: multiplicative
+// cut on loss, multiplicative probe upward while clean and utilized.
+const (
+	// ackInterval is how often the receive side reports delivery per session.
+	ackInterval = 200 * time.Millisecond
+	// ackMinPkts is the minimum packets per interval to treat the measured
+	// loss as signal rather than noise.
+	ackMinPkts = 50
+	// paceChunk bounds packets per paced send so sleep slices stay in the
+	// low-millisecond range where OS timers are accurate.
+	paceChunk = 32
+	// paceBurstCredit is how far the virtual clock may lag wall time: a small
+	// burst allowance after idle without unbounded credit.
+	paceBurstCredit = 5 * time.Millisecond
+	// paceMinRate floors the shaper (2 Mbit/s) so a loss storm cannot choke
+	// the tunnel to nothing; paceMaxRate is where shaping stops mattering and
+	// the session returns to uncapped.
+	paceMinRate = 250e3
+	paceMaxRate = 1.5e9
+	// Loss thresholds and AIMD gains per ack interval.
+	lossEngage = 0.03 // engage/cut mildly above this
+	lossSevere = 0.10 // cut hard above this
+	paceGrow   = 1.25
+	paceCut    = 0.85
+	paceCutBig = 0.6
+	// paceCutGuard spaces rate cuts so one loss event (reported across
+	// consecutive acks) is not punished twice.
+	paceCutGuard = 300 * time.Millisecond
 )
 
 // peerSession holds the per-peer handshake and transport state. All mutable
@@ -80,6 +116,27 @@ type peerSession struct {
 	// packet proves liveness, so the keepalive must not declare a peer dead
 	// while this is fresh — pongs alone are unreliable under congestion.
 	lastRx time.Time
+
+	// Receive-side delivery counters for CtrlAck generation, guarded by mu
+	// with the rest of the receive state. rxMaxCtr/rxAccepted are cumulative
+	// for the current keys; ackSentMax is the last rxMaxCtr already reported.
+	rxMaxCtr   uint64
+	rxAccepted uint64
+	ackSentMax uint64
+
+	// Send-side adaptive shaper state, guarded by paceMu (its own mutex so the
+	// per-chunk pacing never contends with the receive path on mu). paceRate
+	// is the current cap in bytes/sec, 0 = uncapped; paceNext is the virtual
+	// clock; paceSentB accumulates bytes handed to the bind since the last
+	// ack, giving the utilization and engage-rate measurements.
+	paceMu     sync.Mutex
+	paceRate   float64
+	paceNext   time.Time
+	paceSentB  uint64
+	lastAckAt  time.Time
+	lastAckMax uint64
+	lastAckAcc uint64
+	lastCut    time.Time
 
 	// rekeyNotice is a prebuilt CtrlRekey packet sealed under the previous
 	// session keys. driveHandshake retransmits it until the new handshake
@@ -130,6 +187,13 @@ func (s *peerSession) installTransportKeysLocked(cs0, cs1 *noise.CipherState) er
 	s.txAEAD, s.rxAEAD = txAEAD, rxAEAD
 	s.txCtr = 0
 	s.rekeyNotice = nil
+	// Fresh keys restart the counter space: reset the delivery bookkeeping but
+	// keep paceRate — what we learned about the path survives a rekey.
+	s.rxMaxCtr, s.rxAccepted, s.ackSentMax = 0, 0, 0
+	s.paceMu.Lock()
+	s.lastAckAt, s.lastAckMax, s.lastAckAcc = time.Time{}, 0, 0
+	s.paceSentB = 0
+	s.paceMu.Unlock()
 	return nil
 }
 
@@ -154,15 +218,21 @@ func (s *peerSession) decrypt(dst []byte, pkt []byte) ([]byte, error) {
 	nonce := aesgcmNonce(counter)
 	plaintext, err := aead.Open(dst, nonce[:], pkt[transportHeaderLen:], header)
 	if err != nil {
+		Stats.RxDecryptFail.Add(1)
 		return nil, err
 	}
 	s.mu.Lock()
 	fresh := s.replay.Check(counter)
 	if fresh {
 		s.lastRx = time.Now()
+		s.rxAccepted++
+		if counter > s.rxMaxCtr {
+			s.rxMaxCtr = counter
+		}
 	}
 	s.mu.Unlock()
 	if !fresh {
+		Stats.RxReplayDrop.Add(1)
 		return nil, fmt.Errorf("replayed or out-of-window packet from %s", s.addr)
 	}
 	return plaintext, nil
@@ -213,6 +283,147 @@ type PeerConn struct {
 	// tunPkts/tunOK are ReadTunBatch scratch space (single consumer).
 	tunPkts []rxPacket
 	tunOK   []bool
+
+	// fixedRateBits, when non-zero, is a math.Float64bits bytes/sec cap that
+	// overrides the adaptive shaper for every session (the --up-mbit knob).
+	fixedRateBits atomic.Uint64
+}
+
+// SetFixedUploadRate forces a fixed upload cap in bytes/sec across all
+// sessions, disabling the adaptive shaper. 0 restores adaptive mode.
+func (p *PeerConn) SetFixedUploadRate(bytesPerSec float64) {
+	p.fixedRateBits.Store(math.Float64bits(bytesPerSec))
+}
+
+// effectiveRate returns the pacing rate for a session: the manual override if
+// set, else the session's adaptive rate. 0 means uncapped.
+func (p *PeerConn) effectiveRate(s *peerSession) float64 {
+	if f := math.Float64frombits(p.fixedRateBits.Load()); f > 0 {
+		return f
+	}
+	s.paceMu.Lock()
+	r := s.paceRate
+	s.paceMu.Unlock()
+	return r
+}
+
+// paceAdmit charges nbytes against the session's virtual send clock at the
+// given rate, sleeping off any deficit. It also accumulates the sent-bytes
+// meter the ack handler uses for utilization. rate 0 = uncapped, no sleep.
+func (s *peerSession) paceAdmit(nbytes int, rate float64) {
+	s.paceMu.Lock()
+	s.paceSentB += uint64(nbytes)
+	if rate <= 0 {
+		s.paceMu.Unlock()
+		return
+	}
+	now := time.Now()
+	if s.paceNext.Before(now.Add(-paceBurstCredit)) {
+		s.paceNext = now.Add(-paceBurstCredit)
+	}
+	wait := s.paceNext.Sub(now)
+	s.paceNext = s.paceNext.Add(time.Duration(float64(nbytes) / rate * float64(time.Second)))
+	s.paceMu.Unlock()
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+// handleAck folds one CtrlAck delivery report into the session's shaper. Loss
+// is measured from counter-space deltas (Δaccepted vs Δmax-seen), which has no
+// in-flight bias. The shaper engages only on real loss: until then the session
+// sends uncapped, so clean paths (LAN) never pay for shaping.
+func (p *PeerConn) handleAck(s *peerSession, maxCtr, accepted uint64) {
+	if math.Float64frombits(p.fixedRateBits.Load()) > 0 {
+		return // manual override active; adaptive state not maintained
+	}
+	now := time.Now()
+	s.paceMu.Lock()
+	defer s.paceMu.Unlock()
+	if s.lastAckAt.IsZero() || maxCtr < s.lastAckMax {
+		// First report of this key epoch (or a stale one after rekey): just
+		// snapshot a baseline.
+		s.lastAckAt, s.lastAckMax, s.lastAckAcc = now, maxCtr, accepted
+		s.paceSentB = 0
+		return
+	}
+	dMax := maxCtr - s.lastAckMax
+	dAcc := accepted - s.lastAckAcc
+	elapsed := now.Sub(s.lastAckAt).Seconds()
+	sentB := s.paceSentB
+	s.lastAckAt, s.lastAckMax, s.lastAckAcc = now, maxCtr, accepted
+	s.paceSentB = 0
+	if dMax < ackMinPkts || elapsed <= 0 {
+		return // too little traffic to read loss from
+	}
+	loss := 1 - float64(dAcc)/float64(dMax)
+	switch {
+	case loss > lossSevere && now.Sub(s.lastCut) > paceCutGuard:
+		if s.paceRate <= 0 {
+			s.paceRate = float64(sentB) / elapsed
+		}
+		s.paceRate *= paceCutBig
+		s.lastCut = now
+	case loss > lossEngage && now.Sub(s.lastCut) > paceCutGuard:
+		if s.paceRate <= 0 {
+			s.paceRate = float64(sentB) / elapsed
+		}
+		s.paceRate *= paceCut
+		s.lastCut = now
+	case loss < 0.01 && s.paceRate > 0:
+		// Clean interval: probe upward, but only when actually pushing near
+		// the cap — otherwise an idle session's rate would balloon.
+		if float64(sentB) > 0.5*s.paceRate*elapsed {
+			s.paceRate *= paceGrow
+		}
+	}
+	if s.paceRate > 0 {
+		if s.paceRate < paceMinRate {
+			s.paceRate = paceMinRate
+		}
+		if s.paceRate > paceMaxRate {
+			s.paceRate = 0 // outgrew relevance: back to uncapped
+		}
+	}
+	Stats.PaceBps.Store(uint64(s.paceRate))
+}
+
+// ackLoop periodically reports per-session delivery back to each peer, feeding
+// the peer's shaper. ~5 tiny control packets per second per active peer.
+func (p *PeerConn) ackLoop() {
+	ticker := time.NewTicker(ackInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-ticker.C:
+		}
+		p.mu.Lock()
+		sessions := make([]*peerSession, 0, len(p.sessions))
+		for _, s := range p.sessions {
+			sessions = append(sessions, s)
+		}
+		p.mu.Unlock()
+		for _, s := range sessions {
+			s.mu.Lock()
+			est := s.established
+			maxc, acc := s.rxMaxCtr, s.rxAccepted
+			changed := maxc != s.ackSentMax
+			if est && changed {
+				s.ackSentMax = maxc
+			}
+			s.mu.Unlock()
+			if !est || !changed {
+				continue
+			}
+			var payload [17]byte
+			payload[0] = CtrlAck
+			binary.BigEndian.PutUint64(payload[1:9], maxc)
+			binary.BigEndian.PutUint64(payload[9:17], acc)
+			p.sendBatchSession(s, [][]byte{payload[:]}, PacketControl)
+		}
+	}
 }
 
 // NewPeerConn creates a PeerConn on an opened Transport and starts its receive
@@ -244,6 +455,7 @@ func NewPeerConn(t *Transport, privateKey, publicKey, psk, prologue []byte) *Pee
 		p.recvWG.Wait()
 		close(p.recvDone)
 	}()
+	go p.ackLoop()
 	return p
 }
 
@@ -374,12 +586,20 @@ func (p *PeerConn) handlePacket(pkt []byte, ep wgconn.Endpoint) {
 			if gen, ok := p.rearmSession(s, false); ok {
 				go p.watchRearm(s, gen)
 			}
+		case CtrlAck:
+			if len(plaintext) == 17 {
+				p.handleAck(s,
+					binary.BigEndian.Uint64(plaintext[1:9]),
+					binary.BigEndian.Uint64(plaintext[9:17]))
+			}
 		}
 	case PacketData, PacketTun:
 		s := p.sessionForEndpoint(ep)
 		if s == nil {
 			return
 		}
+		Stats.RxPkts.Add(1)
+		Stats.RxBytes.Add(uint64(len(pkt)))
 		buf := getPacketBuf(len(pkt))
 		copy(buf, pkt)
 		select {
@@ -858,18 +1078,37 @@ func (p *PeerConn) sendBatchSession(s *peerSession, payloads [][]byte, pktType b
 		wire[i] = sealPacket(aead, pktType, base+uint64(i), payloads[i])
 	})
 
+	// When the shaper is engaged, hand the batch to the bind in small paced
+	// chunks; uncapped sessions keep full-width batches.
+	rate := p.effectiveRate(s)
+	step := p.batch
+	if rate > 0 && step > paceChunk {
+		step = paceChunk
+	}
 	var err error
-	for off := 0; off < m; off += p.batch {
-		end := off + p.batch
+	for off := 0; off < m; off += step {
+		end := off + step
 		if end > m {
 			end = m
 		}
+		nbytes := 0
+		for _, w := range wire[off:end] {
+			nbytes += len(w) + 28 // + IPv4/UDP header overhead on the wire
+		}
+		s.paceAdmit(nbytes, rate)
 		if e := p.bind.Send(wire[off:end], ep); e != nil && err == nil {
 			err = e
 		}
 	}
+	var payloadBytes uint64
 	for _, w := range wire {
+		payloadBytes += uint64(len(w))
 		putPacketBuf(w)
+	}
+	Stats.TxPkts.Add(uint64(m))
+	Stats.TxBytes.Add(payloadBytes)
+	if err != nil {
+		Stats.TxErrs.Add(1)
 	}
 	return err
 }
@@ -955,6 +1194,7 @@ func (p *PeerConn) RemovePeer(addr *net.UDPAddr) {
 // so the session heals on its own if the outage was transient (the peer never
 // told the rendezvous it left, so nothing else would ever reconnect the two).
 func (p *PeerConn) TimeoutPeer(addr *net.UDPAddr) {
+	Stats.Timeouts.Add(1)
 	key := canonAddrPort(addr.AddrPort()).String()
 	p.mu.Lock()
 	delete(p.missedPings, key)
@@ -1009,6 +1249,7 @@ func (p *PeerConn) rearmSession(s *peerSession, notify bool) (uint64, bool) {
 		return 0, false
 	}
 	s.rekeyNotice = notice
+	Stats.Rekeys.Add(1)
 	go p.driveHandshake(s, gen, time.Now().Add(retryWindow))
 	return gen, true
 }

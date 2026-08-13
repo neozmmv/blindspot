@@ -56,6 +56,10 @@ Both are fed through Argon2id to derive a Tor v3 onion service key, so every
 peer that knows the pair computes the same .onion address with no DNS and no
 rendezvous server. Whoever arrives first hosts the room; the others join it.
 
+The name must be at least 4 characters and the password at least 8. Those are
+minimums, not advice: the password is the only thing protecting the room, and
+guessing it is an offline exercise nobody can rate-limit, so prefer a passphrase.
+
 For the server-based flow, see 'blindspot rendezvous'.`,
 	Args: cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -128,12 +132,15 @@ func runRoomDaemon(name, password string, upMbit int, statusFile string) {
 	// Is somebody already hosting this room?
 	progress("looking for an existing host at " + onionID + ".onion")
 	var discovery *session.Client
-	hosted, why := hostedElsewhere(torClient, onionURL)
+	// hostedElsewhere also reports why it concluded the room was empty; it is
+	// dropped here to keep the CLI line readable. Worth routing to a debug log
+	// if false negatives (publishing over a live host) ever need diagnosing.
+	hosted, _ := hostedElsewhere(torClient, onionURL)
 	if hosted {
 		progress("joining host at " + onionID + ".onion")
 		discovery = session.NewClient(onionURL, roomserver.RoomSessionID, "", torClient)
 	} else {
-		progress("no host found (" + why + "); publishing " + onionID + ".onion")
+		progress("no host found. publishing " + onionID + ".onion")
 		local, closeHost, err := becomeRoomHost(ctx, t, priv)
 		if err != nil {
 			writeStatus("error: publishing room: " + err.Error())
@@ -150,9 +157,11 @@ func runRoomDaemon(name, password string, upMbit int, statusFile string) {
 		discovery: discovery,
 		// Onion rooms have no server-side session to create.
 		createSession: false,
-		// The PSK stays a genuine second factor: it is derived from the same
-		// password but salted with the room name, independent of the onion
-		// address that got us here.
+		// The PSK is derived from the same password as the onion address, so it
+		// is NOT an independent second factor here: anyone who guesses the
+		// password gets both. It still defends the case where the address leaks
+		// without the password (e.g. a descriptor leak), which is why it is
+		// kept — but room security rests on password entropy alone.
 		pskPassword:  password,
 		pskSessionID: name,
 		upMbit:       upMbit,

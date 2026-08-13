@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/neozmmv/blindspot/internal/roomkey"
@@ -87,15 +89,53 @@ func TestForRoomKeyMatchesAddress(t *testing.T) {
 	}
 }
 
-// An empty password would leave the address derivable from the room name alone.
-func TestForRoomRejectsEmptyInput(t *testing.T) {
-	for _, tc := range []struct{ name, password string }{
-		{"", "correct-horse-battery"},
-		{"team-room", ""},
-		{"", ""},
+// Nothing rate-limits guessing a room: candidate addresses are derived offline
+// and only checked against the network. A trivially short password would make
+// the whole room enumerable, so the minimums are enforced before derivation.
+func TestForRoomRejectsShortInput(t *testing.T) {
+	for _, tc := range []struct {
+		desc, name, password string
+		want                 error
+	}{
+		{"empty name", "", "correct-horse-battery", roomkey.ErrNameTooShort},
+		{"empty password", "team-room", "", roomkey.ErrPasswordTooShort},
+		{"both empty", "", "", roomkey.ErrNameTooShort},
+		{"name one under", "abc", "correct-horse-battery", roomkey.ErrNameTooShort},
+		{"password one under", "team-room", "1234567", roomkey.ErrPasswordTooShort},
 	} {
-		if _, _, err := roomkey.ForRoom(tc.name, tc.password); err == nil {
-			t.Fatalf("ForRoom(%q, %q) should have failed", tc.name, tc.password)
-		}
+		t.Run(tc.desc, func(t *testing.T) {
+			_, _, err := roomkey.ForRoom(tc.name, tc.password)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ForRoom(%q, %q) = %v, want %v", tc.name, tc.password, err, tc.want)
+			}
+		})
+	}
+}
+
+// Exactly at the limit must be accepted, or the boundary is off by one.
+func TestForRoomAcceptsMinimumLengths(t *testing.T) {
+	name := strings.Repeat("a", roomkey.MinNameLen)
+	password := strings.Repeat("b", roomkey.MinPasswordLen)
+
+	if _, _, err := roomkey.ForRoom(name, password); err != nil {
+		t.Fatalf("ForRoom at exactly the minimum lengths should succeed, got %v", err)
+	}
+}
+
+// The minimums are in characters, not bytes: a two-character name that happens
+// to encode to six bytes must still be rejected.
+func TestForRoomCountsCharactersNotBytes(t *testing.T) {
+	shortName := "日本" // 2 characters, 6 bytes
+	if len(shortName) < roomkey.MinNameLen {
+		t.Fatalf("test premise broken: %q is only %d bytes", shortName, len(shortName))
+	}
+
+	if _, _, err := roomkey.ForRoom(shortName, "correct-horse-battery"); !errors.Is(err, roomkey.ErrNameTooShort) {
+		t.Fatalf("a 2-character name should be rejected on character count, got %v", err)
+	}
+
+	shortPassword := "パスワード¡" // 6 characters, well over 8 bytes
+	if _, _, err := roomkey.ForRoom("team-room", shortPassword); !errors.Is(err, roomkey.ErrPasswordTooShort) {
+		t.Fatalf("a 6-character password should be rejected on character count, got %v", err)
 	}
 }

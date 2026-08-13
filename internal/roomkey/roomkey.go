@@ -12,7 +12,8 @@ package roomkey
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
-	"errors"
+	"fmt"
+	"unicode/utf8"
 
 	"github.com/cretz/bine/torutil"
 	bineed25519 "github.com/cretz/bine/torutil/ed25519"
@@ -34,10 +35,25 @@ const (
 	seedLen          = 32
 )
 
-// ErrEmpty is returned when either half of the room identity is missing. Both
-// are required: an empty password would make the onion address derivable by
-// anyone who guesses the room name.
-var ErrEmpty = errors.New("room name and password are both required")
+// Minimum lengths for the two halves of a room identity, counted in characters
+// rather than bytes so a short non-ASCII name cannot slip past on byte count.
+//
+// These are a floor against typos and trivially guessable rooms, not a
+// substitute for a strong password. Nothing rate-limits guessing here: an
+// attacker derives candidate addresses entirely offline and only touches the
+// network to check whether a descriptor exists, so the room's security rests
+// on password entropy alone. A passphrase is worth far more than the minimum.
+const (
+	MinNameLen     = 4
+	MinPasswordLen = 8
+)
+
+// ErrNameTooShort and ErrPasswordTooShort report which half failed, so the CLI
+// can tell the user what to fix.
+var (
+	ErrNameTooShort     = fmt.Errorf("room name must be at least %d characters", MinNameLen)
+	ErrPasswordTooShort = fmt.Errorf("room password must be at least %d characters", MinPasswordLen)
+)
 
 // DeriveSeed derives a deterministic 32-byte Ed25519 seed from a room name and
 // password. The name is hashed to a fixed-length salt so that the same password
@@ -65,8 +81,11 @@ func OnionAddress(pub ed25519.PublicKey) string {
 // ForRoom is the one call the CLI needs: it validates the inputs and returns the
 // onion identity to either publish (as host) or dial (as client).
 func ForRoom(name, password string) (ed25519.PrivateKey, string, error) {
-	if name == "" || password == "" {
-		return nil, "", ErrEmpty
+	if utf8.RuneCountInString(name) < MinNameLen {
+		return nil, "", ErrNameTooShort
+	}
+	if utf8.RuneCountInString(password) < MinPasswordLen {
+		return nil, "", ErrPasswordTooShort
 	}
 	priv, pub := KeyPair(DeriveSeed(name, password))
 	return priv, OnionAddress(pub), nil

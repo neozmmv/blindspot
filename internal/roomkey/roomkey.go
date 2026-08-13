@@ -21,16 +21,35 @@ import (
 )
 
 // Argon2id parameters for deriving the onion identity seed from the room
-// password. These match internal/crypto.DerivePSK and follow OWASP's Argon2id
-// guidance (64 MiB, 1 iteration, 4 lanes).
+// password.
 //
-// Tuning tradeoff: raising seedArgonMemory increases the cost of brute-forcing a
-// weak room password into a reachable onion address, but is paid on every
-// `blindspot connect`. Measured at ~0.1s for these values, which is negligible
-// next to the ~23s Tor bootstrap and onion publish that follow it.
+// These deliberately do NOT match internal/crypto.DerivePSK's 64 MiB. That one
+// guards a key exchanged through the rendezvous server, which rate-limits
+// guessing and sits on the interactive path. This one guards a value an
+// attacker can attack entirely offline: derive a candidate seed, compute the
+// .onion, ask Tor whether a descriptor exists. Nothing throttles that, so the
+// only lever is making each guess expensive.
+//
+// The asymmetry is what makes this worth doing. Derivation happens once per
+// `blindspot connect`, inside a command whose Tor bootstrap and descriptor
+// publish were measured at 36-200s — so a sub-second derivation is invisible to
+// the user, while every point of memory cost is paid again by an attacker on
+// every one of billions of guesses.
+//
+// Memory is the knob that matters: Argon2id's resistance to GPU and ASIC attack
+// scales with it, where iteration count only costs time. 512 MiB is 8x the
+// OWASP floor. Measured at 199ms and a 512 MiB peak allocation
+// (BenchmarkDeriveSeed) — check that figure again before targeting genuinely
+// small devices, since it must fit in RAM all at once.
+//
+// THESE VALUES ARE PART OF THE PROTOCOL. They feed the address every peer
+// computes, so changing any of them moves every room to a new .onion. Two peers
+// running different values do not fail to agree — they silently derive
+// different addresses, never see each other, and each ends up hosting its own
+// empty room. Any future change has to be a coordinated, versioned break.
 const (
 	seedArgonTime    = 1
-	seedArgonMemory  = 64 * 1024 // KiB → 64 MiB
+	seedArgonMemory  = 512 * 1024 // KiB → 512 MiB
 	seedArgonThreads = 4
 	seedLen          = 32
 )
@@ -78,14 +97,25 @@ func OnionAddress(pub ed25519.PublicKey) string {
 	return torutil.OnionServiceIDFromV3PublicKey(bineed25519.PublicKey(pub))
 }
 
+// Validate checks the room identity without deriving anything. Callers that
+// only need to reject bad input should use this rather than ForRoom: derivation
+// costs a 512 MiB allocation, so it is not something to do twice for the sake
+// of an early error message.
+func Validate(name, password string) error {
+	if utf8.RuneCountInString(name) < MinNameLen {
+		return ErrNameTooShort
+	}
+	if utf8.RuneCountInString(password) < MinPasswordLen {
+		return ErrPasswordTooShort
+	}
+	return nil
+}
+
 // ForRoom is the one call the CLI needs: it validates the inputs and returns the
 // onion identity to either publish (as host) or dial (as client).
 func ForRoom(name, password string) (ed25519.PrivateKey, string, error) {
-	if utf8.RuneCountInString(name) < MinNameLen {
-		return nil, "", ErrNameTooShort
-	}
-	if utf8.RuneCountInString(password) < MinPasswordLen {
-		return nil, "", ErrPasswordTooShort
+	if err := Validate(name, password); err != nil {
+		return nil, "", err
 	}
 	priv, pub := KeyPair(DeriveSeed(name, password))
 	return priv, OnionAddress(pub), nil

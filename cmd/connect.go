@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -78,8 +79,9 @@ For the server-based flow, see 'blindspot rendezvous'.`,
 			upMbit = utils.LoadConfig().UpMbit
 		}
 
-		// Fail on bad input before spending ~0.1s on Argon2id and far longer on Tor.
-		if _, _, err := roomkey.ForRoom(name, password); err != nil {
+		// Check the inputs without deriving: the real derivation happens once in
+		// the daemon, and at 512 MiB it is not worth doing twice.
+		if err := roomkey.Validate(name, password); err != nil {
 			fmt.Println(err)
 			return
 		}
@@ -109,6 +111,13 @@ func runRoomDaemon(name, password string, upMbit int, statusFile string) {
 		writeStatus("error: " + err.Error())
 		return
 	}
+	// Argon2id just allocated 512 MiB and is done with it, but this daemon then
+	// goes essentially idle — and Go's collector is driven by allocation, so
+	// nothing would ever trigger it. Measured: RSS stays at 529 MiB for the life
+	// of the session without this, and drops to ~18 MiB with it. Forcing the
+	// scavenge costs a few milliseconds, once, at startup.
+	debug.FreeOSMemory()
+
 	onionURL := "http://" + onionID + ".onion"
 
 	ctx, cancel := context.WithCancel(context.Background())

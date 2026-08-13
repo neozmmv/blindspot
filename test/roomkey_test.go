@@ -139,3 +139,15 @@ func TestForRoomCountsCharactersNotBytes(t *testing.T) {
 		t.Fatalf("a 6-character password should be rejected on character count, got %v", err)
 	}
 }
+
+// BenchmarkDeriveSeed exists so the Argon2id cost stays checkable when someone
+// retunes it. Report both time and allocated bytes: the memory figure is the
+// one that governs resistance to GPU and ASIC attack, and also the one that
+// decides whether the derivation fits on a small device.
+//
+//	go test ./test/ -run '^$' -bench DeriveSeed -benchmem -benchtime 3x
+func BenchmarkDeriveSeed(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		roomkey.DeriveSeed("team-room", "correct-horse-battery")
+	}
+}

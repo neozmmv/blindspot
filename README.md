@@ -125,10 +125,10 @@ Creates a virtual network adapter (`blindspot`, `10.x.x.x/8`) and connects all p
 
 ```bash
 # peer A — creates a password-protected session and connects
-blindspot connect -s my-network -p mypassword -n
+blindspot rendezvous -s my-network -p mypassword -n
 
 # peer B — joins the session
-blindspot connect -s my-network -p mypassword
+blindspot rendezvous -s my-network -p mypassword
 ```
 
 The command returns immediately after the daemon starts. To disconnect:
@@ -141,7 +141,7 @@ blindspot disconnect
 
 **Linux:** Must run with `sudo`:
 ```bash
-sudo blindspot connect -s my-network -p mypassword -n
+sudo blindspot rendezvous -s my-network -p mypassword -n
 ```
 
 #### Flags

@@ -22,6 +22,31 @@ type PeerAddr struct {
 
 const defaultRendezvous = "https://rendezvous.enzogp.dev"
 
+// Client talks to one discovery endpoint. It exists so the same registration and
+// SSE logic can run against either the clearnet rendezvous server over the
+// default transport, or a room's onion service over a Tor-backed transport —
+// the only differences are the base URL and the HTTP client.
+//
+// For an onion room, Password is empty: the .onion address is itself the shared
+// secret, so the plain /session/ routes are the whole API surface.
+type Client struct {
+	BaseURL   string
+	SessionID string
+	Password  string
+	HTTP      *http.Client
+}
+
+// NewClient builds a discovery client. A nil hc uses http.DefaultClient. BaseURL
+// is used verbatim, so callers targeting an onion service pass the full
+// "http://<id>.onion" without going through NormalizeHostname (which would
+// reject the plaintext scheme that onion transport security makes moot).
+func NewClient(baseURL, sessionID, password string, hc *http.Client) *Client {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	return &Client{BaseURL: baseURL, SessionID: sessionID, Password: password, HTTP: hc}
+}
+
 // normalizeScheme trims a trailing slash, applies the default host when empty, and
 // defaults a bare host to https://. It does NOT enforce the http:// policy — that
 // is NormalizeHostname's job so that tests/insecure callers can still pass http://.
@@ -52,7 +77,12 @@ func NormalizeHostname(hostname string, insecure bool) (string, error) {
 }
 
 func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
-	hostname = normalizeScheme(hostname)
+	return NewClient(normalizeScheme(hostname), sessionId, password, nil).Register(udpAddr, pubKey, create)
+}
+
+// Register announces this peer and returns everyone already in the session.
+func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
+	hostname, sessionId, password := c.BaseURL, c.SessionID, c.Password
 	if strings.TrimSpace(sessionId) == "" {
 		return nil, fmt.Errorf("sessionId is required")
 	}
@@ -62,7 +92,7 @@ func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool
 			"id":       sessionId,
 			"password": password,
 		})
-		res, err := http.Post(fmt.Sprintf("%s/create_session", hostname), "application/json", bytes.NewBuffer(createBody))
+		res, err := c.HTTP.Post(fmt.Sprintf("%s/create_session", hostname), "application/json", bytes.NewBuffer(createBody))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create session: %w", err)
 		}
@@ -98,7 +128,7 @@ func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool
 		endpoint = fmt.Sprintf("%s/session/%s", hostname, sessionId)
 	}
 
-	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
+	resp, err := c.HTTP.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
 	if err != nil {
 		return nil, fmt.Errorf("failed to register: %w", err)
 	}
@@ -148,7 +178,13 @@ func GetLocalAddr(remotePort int) string {
 // that emits peers as they join the session (including peers already present).
 // The stream closes when quit is closed.
 func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struct{}) <-chan PeerAddr {
-	hostname = normalizeScheme(hostname)
+	return NewClient(normalizeScheme(hostname), sessionId, password, nil).StreamPeers(myAddr, quit)
+}
+
+// StreamPeers opens the SSE connection and emits peers as they join, including
+// those already present. The stream closes when quit is closed.
+func (c *Client) StreamPeers(myAddr string, quit <-chan struct{}) <-chan PeerAddr {
+	hostname, sessionId, password := c.BaseURL, c.SessionID, c.Password
 
 	var endpoint, legacyEndpoint string
 	if password != "" {
@@ -198,7 +234,7 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 			if password != "" && !useLegacyQuery {
 				req.Header.Set("Authorization", "Bearer "+password)
 			}
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := c.HTTP.Do(req)
 			if err != nil {
 				cancel()
 				select {
@@ -261,7 +297,12 @@ func StreamPeers(hostname, sessionId, password, myAddr string, quit <-chan struc
 }
 
 func Leave(hostname, sessionId, password, udpAddr string) {
-	hostname = normalizeScheme(hostname)
+	NewClient(normalizeScheme(hostname), sessionId, password, nil).Leave(udpAddr)
+}
+
+// Leave removes this peer from the session so others stop trying to reach it.
+func (c *Client) Leave(udpAddr string) {
+	hostname, sessionId, password := c.BaseURL, c.SessionID, c.Password
 	body := map[string]string{"udp_addr": udpAddr}
 	if password != "" {
 		body["password"] = password
@@ -273,5 +314,8 @@ func Leave(hostname, sessionId, password, udpAddr string) {
 	} else {
 		endpoint = fmt.Sprintf("%s/session/%s/leave", hostname, sessionId)
 	}
-	http.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
+	resp, err := c.HTTP.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
+	if err == nil {
+		resp.Body.Close()
+	}
 }

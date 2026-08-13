@@ -236,7 +236,7 @@ func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
 	}()
 }
 
-// Connect runs `blindspot connect -s <session> -p <password> [-n] [-H <hostname>]`,
+// Connect runs `blindspot rendezvous -s <session> -p <password> [-n] [-H <hostname>]`,
 // which triggers the UAC elevation + daemon launch and blocks until the session is
 // up (or fails). A non-empty hostname overrides the default rendezvous server. It
 // returns the final status line the CLI printed.
@@ -252,7 +252,7 @@ func (s *TrayService) Connect(session, password string, isNew bool, hostname str
 		return "", fmt.Errorf("already connected — disconnect first")
 	}
 
-	args := []string{"connect", "-s", session}
+	args := []string{"rendezvous", "-s", session}
 	if password != "" {
 		args = append(args, "-p", password)
 	}
@@ -451,7 +451,7 @@ func (s *TrayService) StartReceive(here bool) error {
 func (s *TrayService) startReceiver(here bool) error {
 	ip := s.MyIP()
 	if ip == "" {
-		return fmt.Errorf("no identity found. Run 'blindspot connect' first")
+		return fmt.Errorf("no identity found. Run 'blindspot rendezvous' first")
 	}
 
 	var destDir string

@@ -1,23 +1,54 @@
 name: blindspot Room Test (Tor)
 
-# End-to-end test of the serverless room path: two peers derive the same onion
-# address from a name and password, one hosts it, the other finds it over Tor,
-# and they exchange messages directly.
+# End-to-end tests of the serverless room path: peers derive the same onion
+# address from a name and password, one hosts it, the others find it over Tor,
+# and traffic then flows directly between them.
 #
-# Manual only, on purpose. It depends on the live Tor network, where bootstrap
+# Two shapes, because they cover different things:
+#
+#   room-vpn-peer-a / room-vpn-peer-b  Two runners, two networks — the room
+#                                      equivalent of connection-test.yml, and
+#                                      the only test that hole-punches a room.
+#   room-chat                          Both peers on one runner. Faster and far
+#                                      steadier, but they share a public IP and
+#                                      so take the local-address shortcut rather
+#                                      than punching. It is the smoke test for
+#                                      discovery itself, and the only coverage
+#                                      of chat mode.
+#
+# Manual only, on purpose. These depend on the live Tor network, where bootstrap
 # and descriptor publication were measured anywhere from ~28s to ~187s for the
 # same code, with worse outliers. Gating pull requests on that would fail builds
-# for reasons that have nothing to do with the change under review. Run it
+# for reasons that have nothing to do with the change under review. Run them
 # before releases, and after anything that touches discovery.
 
 on:
   workflow_dispatch:
 
+env:
+  # Both peers derive the room from these. The run id makes it unique per run,
+  # so a previous run's descriptor can never be mistaken for this one's.
+  ROOM_PASSWORD: "ci-room-e2e-password"
+
 jobs:
-  room-chat:
-    name: "two peers over a Tor room"
+  # --- Two runners: a room across two real networks -------------------------
+  #
+  # Unlike the rendezvous test, there is no always-on third party here: whoever
+  # probes an empty room publishes it. Peer B therefore waits before starting,
+  # so that peer A has bootstrapped Tor and published the descriptor first.
+  # The wait is blind (jobs cannot signal each other without serialising them),
+  # which is why it is generous.
+  #
+  # Whichever peer ends up hosting is not asserted: if A is unusually slow to
+  # bootstrap, B publishes and A joins instead. That is a correct outcome. The
+  # failure this cannot fully exclude is both peers publishing inside the same
+  # window, which is split-brain and would show up here as neither peer seeing
+  # the other.
+
+  room-vpn-peer-a:
+    name: "VPN over a Tor room / peer A"
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -27,6 +58,116 @@ jobs:
       # Linux releases bundle no tor binary (the Tor Project publishes no
       # linux-aarch64 Expert Bundle), so blindspot falls back to one on PATH —
       # which is what the install script sets up and what this installs.
+      - name: Install Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tor
+          tor --version | head -1
+
+      - name: Build
+        run: go build -o blindspot .
+
+      # Prints its progress as it goes and returns once the daemon is up. It
+      # gives up by itself after 6 minutes if Tor never bootstraps.
+      #
+      # The success line is checked explicitly because the command exits 0 even
+      # when it reports a failure or a timeout — without this the step passes
+      # and the job only fails ten minutes later, in the wait loop below, with
+      # the real reason scrolled off.
+      - name: Connect to the room
+        run: |
+          sudo ./blindspot connect ciroom${{ github.run_id }} "$ROOM_PASSWORD" | tee connect.log
+          grep -q '^Connected to room' connect.log || { echo "connect did not report success"; exit 1; }
+
+      - name: Wait for peer B (blindspot list)
+        run: |
+          for i in $(seq 1 60); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer B visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/60 — no peer yet, retrying in 10s..."
+            sleep 10
+          done
+          echo "peer B never appeared after 10 minutes"
+          exit 1
+
+      - name: Keep connection alive
+        if: success()
+        run: sleep 30
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect
+
+  room-vpn-peer-b:
+    name: "VPN over a Tor room / peer B"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+
+      - name: Install Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tor
+          tor --version | head -1
+
+      - name: Build
+        run: go build -o blindspot .
+
+      # Long enough to cover peer A's whole cold start — Tor bootstrap, the
+      # "is anybody hosting?" probe, and publishing the descriptor — so that B
+      # finds a room rather than racing A to create one.
+      - name: Wait for peer A to publish the room
+        run: sleep 240
+
+      # See peer A: the exit code alone does not distinguish success here.
+      - name: Connect to the room
+        run: |
+          sudo ./blindspot connect ciroom${{ github.run_id }} "$ROOM_PASSWORD" | tee connect.log
+          grep -q '^Connected to room' connect.log || { echo "connect did not report success"; exit 1; }
+
+      - name: Wait for peer A (blindspot list)
+        run: |
+          for i in $(seq 1 30); do
+            output=$(sudo ./blindspot list 2>/dev/null)
+            if echo "$output" | grep -qE "^10\."; then
+              echo "peer A visible:"
+              echo "$output"
+              exit 0
+            fi
+            echo "attempt $i/30 — no peer yet, retrying in 10s..."
+            sleep 10
+          done
+          echo "peer A never appeared after 5 minutes"
+          exit 1
+
+      - name: Keep connection alive
+        if: success()
+        run: sleep 30
+
+      - name: Disconnect
+        if: always()
+        run: sudo ./blindspot disconnect
+
+  # --- One runner: discovery smoke test, and the only chat coverage ---------
+
+  room-chat:
+    name: "two chat peers over a Tor room"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+
       - name: Install Tor
         run: |
           sudo apt-get update -qq

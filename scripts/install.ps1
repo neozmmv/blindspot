@@ -43,12 +43,19 @@ $Link.Save()
 
 function Get-LatestTorVersion {
     # The Expert Bundle has no "latest" alias, so read the version directories
-    # out of the distribution index and take the highest.
+    # out of the distribution index and take the highest. The pattern skips
+    # alpha directories such as "16.0a9/".
+    #
+    # @() around the pipeline is load-bearing. The index lists only the current
+    # stable and the current alpha, so exactly one directory matches. Without
+    # @() a single match stays a bare string rather than an array, and indexing
+    # a string yields its first character — "1" — which builds a download URL
+    # that 404s.
     try {
         $index = Invoke-WebRequest -Uri "https://dist.torproject.org/torbrowser/" -UseBasicParsing -ErrorAction Stop
-        $versions = [regex]::Matches($index.Content, '>(\d+\.\d+(\.\d+)?)/<') |
+        $versions = @([regex]::Matches($index.Content, '>(\d+\.\d+(\.\d+)?)/<') |
             ForEach-Object { $_.Groups[1].Value } |
-            Sort-Object { [version]$_ } -Descending
+            Sort-Object { [version]$_ } -Descending)
         if ($versions.Count -gt 0) { return $versions[0] }
     } catch { }
     return $null
@@ -65,6 +72,9 @@ if (Test-Path $TorExe) {
     try {
         $ver = Get-LatestTorVersion
         if (-not $ver) { throw "could not determine the latest Tor version" }
+        # Guards against a parse that "succeeded" but produced nonsense, which is
+        # otherwise only visible as a 404 several steps later.
+        if ($ver -notmatch '^\d+\.\d+') { throw "unexpected Tor version '$ver' in the distribution index" }
 
         $arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "i686" }
         $url  = "https://dist.torproject.org/torbrowser/$ver/tor-expert-bundle-windows-$arch-$ver.tar.gz"
@@ -73,7 +83,13 @@ if (Test-Path $TorExe) {
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         $tarball = Join-Path $tmp "teb.tar.gz"
 
-        Invoke-WebRequest -Uri $url -OutFile $tarball -ErrorAction Stop
+        # The URL goes in the message: a download failure is almost always a
+        # wrong URL, and without it the error says only "404".
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $tarball -ErrorAction Stop
+        } catch {
+            throw "downloading $url failed: $($_.Exception.Message)"
+        }
         # tar ships with Windows 10 1803 and later.
         tar -xzf $tarball -C $tmp
         if ($LASTEXITCODE -ne 0) { throw "extracting the bundle failed" }

@@ -17,7 +17,7 @@ import (
 
 func newTestRoom(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := roomserver.New("test", "nonce-1")
+	srv := roomserver.New("test", "nonce-1", roomserver.ModeVPN)
 	// Keep the SSE keepalive short so a finished test's handler returns promptly
 	// instead of parking on the 30s production interval.
 	srv.SetStreamKeepAlive(200 * time.Millisecond)
@@ -298,7 +298,7 @@ func TestLeaveRemovesPeer(t *testing.T) {
 // A peer that stops re-registering must age out, or a crashed peer would linger
 // in the room forever and be handed to others as a hole-punch target.
 func TestPeerExpiresAfterTTL(t *testing.T) {
-	srv := roomserver.New("test", "nonce-1")
+	srv := roomserver.New("test", "nonce-1", roomserver.ModeVPN)
 	srv.SetPeerTTL(300 * time.Millisecond)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -321,7 +321,7 @@ func TestPeerExpiresAfterTTL(t *testing.T) {
 // Re-registering inside the TTL must cancel the pending expiry, otherwise the
 // original watcher would evict a peer that is actively keeping itself alive.
 func TestReRegistrationCancelsPendingExpiry(t *testing.T) {
-	srv := roomserver.New("test", "nonce-1")
+	srv := roomserver.New("test", "nonce-1", roomserver.ModeVPN)
 	srv.SetPeerTTL(400 * time.Millisecond)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -338,9 +338,10 @@ func TestReRegistrationCancelsPendingExpiry(t *testing.T) {
 }
 
 // /version carries the host nonce that failover uses to detect that another
-// peer's descriptor has replaced this host's.
-func TestVersionReportsHostSession(t *testing.T) {
-	srv := roomserver.New("v1.2.3", "nonce-xyz")
+// peer's descriptor has replaced this host's, and the mode that tells an
+// arriving peer whether this room is theirs to join at all.
+func TestVersionReportsHostSessionAndMode(t *testing.T) {
+	srv := roomserver.New("v1.2.3", "nonce-xyz", roomserver.ModeChat)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -351,13 +352,14 @@ func TestVersionReportsHostSession(t *testing.T) {
 	defer resp.Body.Close()
 
 	var out struct {
-		Version     string `json:"version"`
-		HostSession string `json:"host_session"`
+		Version     string          `json:"version"`
+		HostSession string          `json:"host_session"`
+		Mode        roomserver.Mode `json:"mode"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if out.Version != "v1.2.3" || out.HostSession != "nonce-xyz" {
+	if out.Version != "v1.2.3" || out.HostSession != "nonce-xyz" || out.Mode != roomserver.ModeChat {
 		t.Fatalf("unexpected /version payload: %+v", out)
 	}
 }

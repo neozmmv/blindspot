@@ -19,6 +19,27 @@ func Prologue(sessionId string) []byte {
 	return append([]byte("blindspot/v2|"), []byte(sessionId)...)
 }
 
+// ChatPrologue is Prologue for chat peers.
+//
+// Chat and VPN peers must never establish a session with each other. They can
+// meet: a room's onion address, PSK and prologue all come from the same name
+// and password, so without this they would handshake successfully and then
+// ignore everything the other sent — one only ever emits TUN packets, the other
+// only DATA. To both users that looks like a working connection that silently
+// carries nothing.
+//
+// Discovery already turns a peer of the wrong mode away at the door, with an
+// error naming the command to use instead. This is the backstop for the case
+// discovery cannot catch: two peers of different modes publishing the room at
+// the same instant, one of which ends up registered in the other's room. A
+// distinct prologue makes that handshake fail outright.
+//
+// VPN keeps the bare prologue so peers on the public rendezvous server stay
+// compatible across releases.
+func ChatPrologue(sessionId string) []byte {
+	return append([]byte("blindspot/v2|chat|"), []byte(sessionId)...)
+}
+
 // newInitiatorHandshake builds the initiator side of a Noise IKpsk2 handshake.
 // remoteStatic is the responder's static public key, pinned from the trusted
 // rendezvous — this is what makes the on-path attacker unable to impersonate the

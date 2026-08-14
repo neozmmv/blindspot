@@ -15,6 +15,7 @@ import (
 	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
 	"github.com/neozmmv/blindspot/internal/roomkey"
+	"github.com/neozmmv/blindspot/internal/roomserver"
 	"github.com/neozmmv/blindspot/internal/utils"
 	"github.com/spf13/cobra"
 )
@@ -69,7 +70,7 @@ func runChatRoom(name, password string) {
 	}
 
 	fmt.Println("Deriving room address and starting Tor; this can take a minute...")
-	room, err := joinRoom(ctx, name, password, progress)
+	room, err := joinRoom(ctx, name, password, roomserver.ModeChat, progress)
 	if err != nil {
 		fmt.Println("Error joining room:", err)
 		return
@@ -98,8 +99,11 @@ func runChatSession(ref *discoveryRef, roomName, password string, live *atomic.B
 	// PSK comes from the same password as the onion address, so it is not an
 	// independent factor here; it still covers the case where the address leaks
 	// without the password.
+	//
+	// The chat prologue is what makes a handshake with a VPN peer impossible
+	// rather than merely unlikely — see network.ChatPrologue.
 	psk := crypto.DerivePSK(password, roomName)
-	prologue := network.Prologue(roomName)
+	prologue := network.ChatPrologue(roomName)
 	myPubKeyB64 := base64.StdEncoding.EncodeToString(publicKey)
 
 	tr, err := network.OpenTransport()

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/neozmmv/blindspot/internal/roomkey"
+	"github.com/neozmmv/blindspot/internal/roomserver"
 	"github.com/neozmmv/blindspot/internal/utils"
 	"github.com/spf13/cobra"
 )
@@ -78,7 +79,7 @@ func runRoomDaemon(name, password string, upMbit int, statusFile string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	room, err := joinRoom(ctx, name, password, progress)
+	room, err := joinRoom(ctx, name, password, roomserver.ModeVPN, progress)
 	if err != nil {
 		writeStatus("error: " + err.Error())
 		return

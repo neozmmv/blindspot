@@ -36,7 +36,7 @@ func TestHostedElsewhereDetectsLiveHost(t *testing.T) {
 	calls := 0
 	client := probeClient(t, &calls, func(int) (*http.Response, error) { return okResponse(), nil })
 
-	hosted, why := hostedElsewhere(client, "http://example.onion")
+	hosted, _, why := hostedElsewhere(client, "http://example.onion")
 	if !hosted {
 		t.Fatalf("expected the live host to be detected, got not-hosted (%s)", why)
 	}
@@ -57,7 +57,7 @@ func TestHostedElsewhereShortCircuitsOnUnreachable(t *testing.T) {
 		return nil, errors.New("socks connect tcp 127.0.0.1:9050->x.onion:80: unknown error host unreachable")
 	})
 
-	hosted, why := hostedElsewhere(client, "http://example.onion")
+	hosted, _, why := hostedElsewhere(client, "http://example.onion")
 	if hosted {
 		t.Fatal("unreachable onion should not be reported as hosted")
 	}
@@ -80,7 +80,7 @@ func TestHostedElsewhereRetriesAmbiguousFailures(t *testing.T) {
 		return nil, errors.New("context deadline exceeded")
 	})
 
-	if hosted, _ := hostedElsewhere(client, "http://example.onion"); hosted {
+	if hosted, _, _ := hostedElsewhere(client, "http://example.onion"); hosted {
 		t.Fatal("should not report hosted when every attempt failed")
 	}
 	if calls != roomProbeAttempts {
@@ -102,7 +102,7 @@ func TestHostedElsewhereRecoversAfterSingleMiss(t *testing.T) {
 		return okResponse(), nil
 	})
 
-	if hosted, why := hostedElsewhere(client, "http://example.onion"); !hosted {
+	if hosted, _, why := hostedElsewhere(client, "http://example.onion"); !hosted {
 		t.Fatalf("host answering on the second attempt should be found, got %s", why)
 	}
 }
@@ -122,7 +122,7 @@ func TestHostedElsewhereTreatsNon200AsNotHosted(t *testing.T) {
 		}, nil
 	})
 
-	hosted, why := hostedElsewhere(client, "http://example.onion")
+	hosted, _, why := hostedElsewhere(client, "http://example.onion")
 	if hosted {
 		t.Fatal("a non-200 response should not count as a healthy host")
 	}

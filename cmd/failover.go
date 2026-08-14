@@ -55,6 +55,7 @@ type roomSupervisor struct {
 	onionURL  string
 	torClient *http.Client
 	ref       *discoveryRef
+	mode      roomserver.Mode
 	progress  func(string)
 
 	mu        sync.Mutex
@@ -67,6 +68,10 @@ type roomSupervisor struct {
 type versionInfo struct {
 	Version     string `json:"version"`
 	HostSession string `json:"host_session"`
+	// Mode is what the host is running the room for. Empty from a host built
+	// before rooms carried a mode, which could only ever have been a VPN room —
+	// see roomMode.
+	Mode roomserver.Mode `json:"mode"`
 }
 
 // fetchVersion asks whoever currently answers the room address who they are.
@@ -101,7 +106,7 @@ func (s *roomSupervisor) startHosting(ctx context.Context) error {
 		return nil
 	}
 
-	local, nonce, closeHost, err := publishRoom(ctx, s.tor, s.priv)
+	local, nonce, closeHost, err := publishRoom(ctx, s.tor, s.priv, s.mode)
 	if err != nil {
 		return err
 	}
@@ -131,6 +136,9 @@ func (s *roomSupervisor) stopHosting() {
 // whether this peer is currently the host.
 func (s *roomSupervisor) run(ctx context.Context, quit <-chan struct{}) {
 	failures := 0
+	// Reported once, not every heartbeat: a foreign-mode host does not resolve
+	// itself, and repeating it would bury everything else the session prints.
+	warnedForeign := false
 	for {
 		interval := hostHeartbeatInterval
 		if s.isHosting() {
@@ -150,8 +158,20 @@ func (s *roomSupervisor) run(ctx context.Context, quit <-chan struct{}) {
 			continue
 		}
 
-		if _, err := fetchVersion(s.torClient, s.onionURL); err == nil {
+		if info, err := fetchVersion(s.torClient, s.onionURL); err == nil {
 			failures = 0
+			// The address answers, but for the other mode — the losing side of
+			// two peers publishing at once. Nothing here can fix it (the
+			// descriptor is theirs now), and no peer connection can form across
+			// modes, so the session is inert. Say so rather than leaving the
+			// user watching a room that will never fill.
+			if sameMode(s.mode, info.Mode) {
+				warnedForeign = false // a host of our own mode is back; a later foreign one is worth reporting again
+			} else if !warnedForeign {
+				warnedForeign = true
+				s.progress("this room is now hosted for " + modeName(info.Mode) +
+					"; no peers will connect. Restart with " + modeCommand(info.Mode) + ", or use a different room name")
+			}
 			continue
 		}
 		if failures++; failures < hostFailuresBeforeTakeover {
@@ -178,7 +198,15 @@ func (s *roomSupervisor) selfCheck() {
 		return
 	}
 	if v.HostSession != "" && v.HostSession != mine {
-		s.progress("another peer took over the room; stepping down to client")
+		if !sameMode(s.mode, v.Mode) {
+			// Both sides published at once and theirs won. Stepping down is
+			// still forced — our descriptor is gone — but name the reason,
+			// because from here nothing will ever connect.
+			s.progress("another peer took over the room for " + modeName(v.Mode) +
+				"; no peers will connect. Restart with " + modeCommand(v.Mode) + ", or use a different room name")
+		} else {
+			s.progress("another peer took over the room; stepping down to client")
+		}
 		s.stopHosting()
 	}
 }
@@ -214,14 +242,14 @@ func (s *roomSupervisor) attemptTakeover(ctx context.Context, quit <-chan struct
 // publishRoom starts an onion service for the room and serves the room API on
 // it, plus on a loopback listener whose URL is returned so the hosting peer can
 // register with its own room without a pointless round trip through Tor.
-func publishRoom(ctx context.Context, t *tor.Tor, priv ed25519.PrivateKey) (localURL, nonce string, closeFn func(), err error) {
+func publishRoom(ctx context.Context, t *tor.Tor, priv ed25519.PrivateKey, mode roomserver.Mode) (localURL, nonce string, closeFn func(), err error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", "", nil, fmt.Errorf("generating host nonce: %w", err)
 	}
 	nonce = hex.EncodeToString(raw)
 
-	srv := roomserver.New(getVersion(), nonce)
+	srv := roomserver.New(getVersion(), nonce, mode)
 	handler := srv.Handler()
 
 	loopback, err := net.Listen("tcp", "127.0.0.1:0")

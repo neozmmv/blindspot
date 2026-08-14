@@ -34,7 +34,7 @@ func newSupervisor(t *testing.T, url string, log *[]string) *roomSupervisor {
 }
 
 func TestFetchVersionParsesHostSession(t *testing.T) {
-	ts := httptest.NewServer(roomserver.New("v9", "nonce-abc").Handler())
+	ts := httptest.NewServer(roomserver.New("v9", "nonce-abc", roomserver.ModeVPN).Handler())
 	defer ts.Close()
 
 	v, err := fetchVersion(http.DefaultClient, ts.URL)
@@ -60,7 +60,7 @@ func TestFetchVersionErrorsOnNon200(t *testing.T) {
 // The core of the split-brain defence: if the address now answers with somebody
 // else's nonce, our descriptor was overwritten and we must stop serving.
 func TestSelfCheckStepsDownWhenAnotherHostAnswers(t *testing.T) {
-	ts := httptest.NewServer(roomserver.New("v9", "somebody-else").Handler())
+	ts := httptest.NewServer(roomserver.New("v9", "somebody-else", roomserver.ModeVPN).Handler())
 	defer ts.Close()
 
 	var log []string
@@ -78,7 +78,7 @@ func TestSelfCheckStepsDownWhenAnotherHostAnswers(t *testing.T) {
 
 // Our own nonce coming back means we are still the host; nothing should change.
 func TestSelfCheckKeepsHostingWhenNonceMatches(t *testing.T) {
-	ts := httptest.NewServer(roomserver.New("v9", "mine").Handler())
+	ts := httptest.NewServer(roomserver.New("v9", "mine", roomserver.ModeVPN).Handler())
 	defer ts.Close()
 
 	var log []string
@@ -118,7 +118,7 @@ func TestSelfCheckKeepsHostingWhenUnreachable(t *testing.T) {
 // If somebody else won the election while we were waiting out our stagger, we
 // must not publish over them.
 func TestAttemptTakeoverYieldsWhenRoomIsAnsweringAgain(t *testing.T) {
-	ts := httptest.NewServer(roomserver.New("v9", "the-winner").Handler())
+	ts := httptest.NewServer(roomserver.New("v9", "the-winner", roomserver.ModeVPN).Handler())
 	defer ts.Close()
 
 	var log []string

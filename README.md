@@ -40,6 +40,16 @@ The room API the host serves ([`internal/roomserver`](internal/roomserver)) is t
 
 **Hosting moves.** Because the address is derived, it never changes — so a client keeps talking to the same URL no matter who is behind it. Clients heartbeat the host every 45s; after three consecutive failures they hold an election staggered by join order, and the winner republishes the descriptor and takes over. Peers keep their live connections through a handover: only the discovery endpoint changes, not the UDP transport, the Noise sessions or the TUN device.
 
+**One room, one mode.** A room is either a VPN room (`connect`) or a chat room (`chat`), decided by whoever hosts it first and fixed for the room's life. The two modes share no traffic types — one sends only tunnelled IP packets, the other only chat messages — so a peer arriving with the wrong command is refused outright, with an error naming the command that would work:
+
+```
+$ blindspot chat my-room "correct horse battery staple"
+Error joining room: room "my-room" is already in use for VPN — join it with
+"blindspot connect", or pick a different room name
+```
+
+The room that already exists always wins; the arriving peer never takes it over. Peers of different modes also commit to different Noise prologues, so even in the race where two of them publish the room at the same instant, the handshake between them fails rather than producing two peers that look connected and silently carry nothing.
+
 **Expect it to be slow to start.** Deriving the key, bootstrapping Tor and publishing or fetching a descriptor was measured anywhere between ~28s and ~187s for the same code on the same machine. The commands print each step as it happens; `connect` waits up to 6 minutes before giving up.
 
 ### Rendezvous server — `rendezvous`
@@ -92,7 +102,7 @@ Inner control opcodes (plaintext inside an encrypted CONTROL packet):
 
 - **Static keys are pinned, not exchanged in the clear.** Unlike v1 (where the public key rode inside the `HELLO` packet), the static public key is *never* sent on the wire. Each peer publishes its key through discovery, and both sides pin the other's key before the handshake begins. This is what neutralises an on-path attacker: they cannot substitute their own key for a peer's.
 - **Pre-shared key as a second factor.** The session password is stretched with **Argon2id** (64 MiB, 1 iteration, 4 lanes, salted with the session id) into a 32-byte PSK, mixed in at the `psk2` position. Against the rendezvous server it is genuine defense-in-depth: even if the server were compromised and published a forged static key, an attacker still could not complete the handshake without the password. In a room it is *not* an independent factor — the same password derives the onion address — but it still covers the case where the address leaks and the password does not. Password-less ("open") rendezvous sessions use a deterministic-but-public PSK, so authentication then rests entirely on the pinned static key.
-- **Prologue binding.** The handshake prologue commits to the protocol version and session id (the room name, for rooms), so a handshake captured in one session or version can't be replayed into another.
+- **Prologue binding.** The handshake prologue commits to the protocol version and session id (the room name, for rooms), so a handshake captured in one session or version can't be replayed into another. Chat peers commit to a distinct prologue, which is what makes a chat↔VPN session impossible rather than merely refused at discovery.
 
 **Transport packets.** After the handshake, `DATA`, `TUN`, and `CONTROL` packets share one authenticated, anti-replay-protected channel. Each transport body is:
 
@@ -257,6 +267,8 @@ Connected! Type to chat.
 ```
 
 Messages are broadcast to every connected peer. Type `/quit` or `/exit`, or press Ctrl+C, to leave. The chat runs in the foreground and takes no flags — the room name and password are the whole interface.
+
+A chat room and a VPN room are separate things even under the same name and password: `chat` refuses a room that `connect` is hosting, and vice versa. See [One room, one mode](#serverless-rooms--connect--chat).
 
 ---
 

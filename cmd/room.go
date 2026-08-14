@@ -55,13 +55,58 @@ type roomSession struct {
 	quit chan struct{}
 }
 
+// sameMode reports whether a host's advertised mode is the one this peer is
+// running.
+//
+// An empty mode is a host built before rooms advertised one. Those could only
+// ever have been VPN rooms — `chat` reached rooms in the same release that
+// added the field — so that is what an empty value means, rather than "unknown,
+// let it through".
+func sameMode(want, got roomserver.Mode) bool {
+	if got == "" {
+		got = roomserver.ModeVPN
+	}
+	return want == got
+}
+
+// modeCommand names the command that joins a room of the given mode, for error
+// messages that tell the user what to run instead.
+func modeCommand(m roomserver.Mode) string {
+	if m == roomserver.ModeChat {
+		return "blindspot chat"
+	}
+	return "blindspot connect"
+}
+
+// modeName is how a mode is written in a message to the user.
+func modeName(m roomserver.Mode) string {
+	if m == roomserver.ModeChat {
+		return "chat"
+	}
+	return "VPN"
+}
+
+// wrongMode is the error a peer gets when the room it derived is already being
+// run for the other mode.
+//
+// The room that exists wins: this peer refuses rather than publishing a
+// competing descriptor, which would split the room between two hosts and strand
+// whoever is already in it.
+func wrongMode(name string, got roomserver.Mode) error {
+	return fmt.Errorf("room %q is already in use for %s — join it with %q, or pick a different room name",
+		name, modeName(got), modeCommand(got))
+}
+
 // joinRoom derives the room's onion address from name+password, starts Tor, and
 // either joins the peer already hosting the room or publishes it. Each step is
 // reported through progress, because the chain routinely takes over a minute
 // and silence for that long is indistinguishable from a hang.
 //
+// mode is what this peer intends the room for. A room already running the other
+// mode is refused outright: see wrongMode.
+//
 // The caller owns ctx and must call close on the result.
-func joinRoom(ctx context.Context, name, password string, progress func(string)) (*roomSession, error) {
+func joinRoom(ctx context.Context, name, password string, mode roomserver.Mode, progress func(string)) (*roomSession, error) {
 	priv, onionID, err := roomkey.ForRoom(name, password)
 	if err != nil {
 		return nil, err
@@ -98,6 +143,7 @@ func joinRoom(ctx context.Context, name, password string, progress func(string))
 		onionURL:  onionURL,
 		torClient: torClient,
 		ref:       ref,
+		mode:      mode,
 		progress:  progress,
 	}
 
@@ -105,7 +151,11 @@ func joinRoom(ctx context.Context, name, password string, progress func(string))
 	// hostedElsewhere also reports why it concluded the room was empty; it is
 	// dropped here to keep the CLI line readable. Worth routing to a debug log
 	// if false negatives (publishing over a live host) ever need diagnosing.
-	if hosted, _ := hostedElsewhere(torClient, onionURL); hosted {
+	if hosted, info, _ := hostedElsewhere(torClient, onionURL); hosted {
+		if !sameMode(mode, info.Mode) {
+			t.Close()
+			return nil, wrongMode(name, info.Mode)
+		}
 		progress("joining host at " + onionID + ".onion")
 	} else {
 		progress("no host found. publishing " + onionID + ".onion")
@@ -132,54 +182,56 @@ func (r *roomSession) close() {
 	r.tor.Close()
 }
 
-// hostedElsewhere reports whether the room's onion service already answers, and
-// why it concluded otherwise.
+// hostedElsewhere reports whether the room's onion service already answers,
+// what that host said about itself, and why it concluded otherwise.
 //
 // The reason matters for tuning and for debugging false negatives: concluding
 // "empty" when a host is actually up makes this peer publish a competing
 // descriptor, and since HSDir publication is last-writer-wins that shows up as
 // the room's address flapping between two backends rather than as a clean error.
-func hostedElsewhere(client *http.Client, onionURL string) (bool, string) {
+//
+// A host counts as up only if it returns a /version payload that decodes. That
+// is stricter than checking the status code, and deliberately so: the reply is
+// where the room's mode comes from, and a 200 carrying something else is not a
+// room this peer can join.
+func hostedElsewhere(client *http.Client, onionURL string) (bool, versionInfo, string) {
 	var last string
 	misses := 0
 	for i := 0; i < roomProbeAttempts; i++ {
 		started := time.Now()
-		resp, err := client.Get(onionURL + "/version")
+		info, err := fetchVersion(client, onionURL)
 		took := time.Since(started).Round(time.Second)
 
 		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return true, ""
-			}
-			last = fmt.Sprintf("attempt %d: HTTP %d after %s", i+1, resp.StatusCode, took)
-		} else {
-			last = fmt.Sprintf("attempt %d: %v after %s", i+1, err, took)
-			// Tor answers with SOCKS5 "host unreachable" when it cannot reach the
-			// service at all — typically because no descriptor is published, i.e.
-			// nobody is hosting. That arrives in seconds, where an ambiguous
-			// failure burns the full per-attempt timeout, so treating it as
-			// conclusive is the difference between hosting an empty room in ~15s
-			// and in ~200s.
-			//
-			// It is not completely unambiguous: the same code appears when a
-			// descriptor exists but its introduction points are failing. Two
-			// consecutive misses are required before acting, so a host having one
-			// bad moment does not get a competing descriptor published over it.
-			if isOnionUnreachable(err) {
-				if misses++; misses >= 2 {
-					return false, last
-				}
-				time.Sleep(roomProbeBackoff)
-				continue
-			}
-			misses = 0
+			return true, info, ""
 		}
+
+		last = fmt.Sprintf("attempt %d: %v after %s", i+1, err, took)
+		// Tor answers with SOCKS5 "host unreachable" when it cannot reach the
+		// service at all — typically because no descriptor is published, i.e.
+		// nobody is hosting. That arrives in seconds, where an ambiguous
+		// failure burns the full per-attempt timeout, so treating it as
+		// conclusive is the difference between hosting an empty room in ~15s
+		// and in ~200s.
+		//
+		// It is not completely unambiguous: the same code appears when a
+		// descriptor exists but its introduction points are failing. Two
+		// consecutive misses are required before acting, so a host having one
+		// bad moment does not get a competing descriptor published over it.
+		if isOnionUnreachable(err) {
+			if misses++; misses >= 2 {
+				return false, versionInfo{}, last
+			}
+			time.Sleep(roomProbeBackoff)
+			continue
+		}
+		misses = 0
+
 		if i < roomProbeAttempts-1 {
 			time.Sleep(roomProbeBackoff)
 		}
 	}
-	return false, last
+	return false, versionInfo{}, last
 }
 
 // isOnionUnreachable matches Tor's SOCKS5 "host unreachable" reply.

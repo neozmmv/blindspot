@@ -40,6 +40,22 @@ const StreamKeepAlive = 30 * time.Second
 // internal/session already speaks.
 const RoomSessionID = "room"
 
+// Mode is what a room is for, reported from /version so a peer can refuse to
+// join a room running the other mode.
+//
+// A room is one or the other for its whole life. The name and password derive
+// one onion address, so `connect` and `chat` in the same room would meet, share
+// key material, complete a handshake — and then ignore each other completely,
+// since one side only ever sends TUN packets and the other only DATA. That
+// looks exactly like a working connection to both users, which is why the
+// modes are kept apart at the door instead.
+type Mode string
+
+const (
+	ModeVPN  Mode = "vpn"
+	ModeChat Mode = "chat"
+)
+
 // Peer is one participant's reachability info, as broadcast to the room.
 type Peer struct {
 	IP        string `json:"ip"`
@@ -67,12 +83,15 @@ type Server struct {
 	room        *room
 	version     string
 	hostSession string
+	mode        Mode
 }
 
 // New builds a room server. hostSession is a nonce identifying this host
 // process; it is echoed from /version so a host can detect that another peer's
-// descriptor has overwritten its own (see the failover design).
-func New(version, hostSession string) *Server {
+// descriptor has overwritten its own (see the failover design). mode is what
+// this host is running the room for, and is echoed from /version so peers of
+// the other mode can be turned away rather than silently admitted.
+func New(version, hostSession string, mode Mode) *Server {
 	return &Server{
 		room: &room{
 			indexByAddr: map[string]int{},
@@ -82,6 +101,7 @@ func New(version, hostSession string) *Server {
 		},
 		version:     version,
 		hostSession: hostSession,
+		mode:        mode,
 	}
 }
 
@@ -119,6 +139,7 @@ func (s *Server) versionInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"version":      s.version,
 		"host_session": s.hostSession,
+		"mode":         s.mode,
 	})
 }
 

@@ -130,8 +130,20 @@ func Start(ctx context.Context) (*tor.Tor, error) {
 
 // HTTPTransport returns a transport whose connections are dialled through Tor,
 // for reaching a room's onion service.
+//
+// This is where the bootstrap wait actually happens: Start launches tor with
+// DisableNetwork=1, and bine enables the network — blocking until bootstrap
+// reports 100% — when the dialer is built. Hence the bound: a bootstrap that
+// never completes would otherwise hang the caller forever with no output, and
+// only `connect` has a supervisor above it that would eventually give up.
+//
+// The bound covers construction only. bine's Dialer does not retain this
+// context; each connection is dialled with the one the HTTP request carries.
 func HTTPTransport(ctx context.Context, t *tor.Tor) (*http.Transport, error) {
-	dialer, err := t.Dialer(ctx, nil)
+	bootstrapCtx, cancel := context.WithTimeout(ctx, BootstrapTimeout)
+	defer cancel()
+
+	dialer, err := t.Dialer(bootstrapCtx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating tor dialer: %w", err)
 	}

@@ -17,7 +17,6 @@ import (
 
 	"github.com/neozmmv/blindspot/internal/crypto"
 	"github.com/neozmmv/blindspot/internal/network"
-	"github.com/neozmmv/blindspot/internal/session"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
 )
@@ -169,6 +168,7 @@ func runSessionDaemon(p daemonParams) {
 	// from here on, defer owns all cleanup
 	var (
 		tunDevice  bstun.Device
+		roster     *peerRoster
 		registered bool
 		publicAddr string
 	)
@@ -186,8 +186,7 @@ func runSessionDaemon(p daemonParams) {
 		}
 		exec.Command("route", "delete", "10.0.0.0", "mask", "255.0.0.0").Run() // best effort cleanup of route
 		if registered {
-			cur, _ := p.discovery.current()
-			cur.Leave(publicAddr)
+			roster.leave()
 		}
 		peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
 		peerConn.Close()         // stop handshake drivers/consumers and close the bind
@@ -202,14 +201,13 @@ func runSessionDaemon(p daemonParams) {
 		return
 	}
 
-	regClient, _ := p.discovery.current()
-	peers, selfIndex, err := regClient.Register(publicAddr, myPubKeyB64, p.createSession)
+	roster = newPeerRoster(p.discovery, peerConn, publicAddr, myPubKeyB64)
+	peers, err := roster.join(p.createSession)
 	if err != nil {
 		writeStatus("error: " + err.Error())
 		return
 	}
 	registered = true
-	p.discovery.setSelfIndex(selfIndex)
 
 	myVirtualIP := bstun.VirtualIPv4(publicKey)
 	tunDevice, err = bstun.Create(myVirtualIP)
@@ -218,95 +216,11 @@ func runSessionDaemon(p daemonParams) {
 		return
 	}
 
-	myPublicIP := strings.Split(publicAddr, ":")[0]
-
-	// knownPeers tracks which resolved peer addresses have been handed to
-	// AddKnownPeer, so rendezvous announcements are not re-added while a session
-	// is live. Entries are removed when a peer dies so it can reconnect later.
-	// Guarded by peersMu: it is touched by the initial loop, the SSE stream, the
-	// periodic re-register, and the Dead handler.
-	var peersMu sync.Mutex
-	knownPeers := make(map[string]bool)
-
-	// addPeer validates a rendezvous-announced peer and, if it is new, registers
-	// its pinned static key and kicks off the Noise handshake.
-	addPeer := func(peer session.PeerAddr) {
-		peerAddrStr := peer.Public
-		if strings.Split(peer.Public, ":")[0] == myPublicIP && peer.Local != "" {
-			peerAddrStr = peer.Local
-		}
-		peerAddr, err := net.ResolveUDPAddr("udp", peerAddrStr)
-		if err != nil {
-			return
-		}
-		if !network.IsValidPeerAddr(peerAddr) {
-			return // reject broadcast/multicast/unspecified IPs and privileged ports
-		}
-		pub, err := base64.StdEncoding.DecodeString(peer.PubKey)
-		if err != nil || len(pub) != 32 {
-			return // no valid pubkey from the rendezvous → cannot handshake
-		}
-		peersMu.Lock()
-		if knownPeers[peerAddr.String()] {
-			peersMu.Unlock()
-			return
-		}
-		knownPeers[peerAddr.String()] = true
-		peersMu.Unlock()
-		peerConn.AddKnownPeer(peerAddr, pub)
-	}
-
 	for _, peer := range peers {
-		addPeer(peer)
+		roster.add(peer)
 	}
-
-	// Periodically re-register to keep the rendezvous session TTL alive. The
-	// response lists the session's current peers — feed it through addPeer so a
-	// peer that died and was forgotten (or an announcement the stream missed)
-	// gets picked up again.
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-quit:
-				return
-			case <-p.discovery.wakeCh():
-				// discovery moved to a new host; register there right away
-				cur, _ := p.discovery.current()
-				if current, idx, err := cur.Register(publicAddr, myPubKeyB64, false); err == nil {
-					p.discovery.setSelfIndex(idx)
-					for _, peer := range current {
-						addPeer(peer)
-					}
-				}
-			case <-ticker.C:
-				cur, _ := p.discovery.current()
-				if current, idx, err := cur.Register(publicAddr, myPubKeyB64, false); err == nil {
-					p.discovery.setSelfIndex(idx)
-					for _, peer := range current {
-						addPeer(peer)
-					}
-				}
-			}
-		}
-	}()
-
-	// The stream is re-established whenever discovery is swapped, so a handover
-	// to a new host reconnects instead of silently going deaf on the old one.
-	go func() {
-		for {
-			select {
-			case <-quit:
-				return
-			default:
-			}
-			cur, superseded := p.discovery.current()
-			for peer := range cur.StreamPeers(publicAddr, anyClosed(quit, superseded)) {
-				addPeer(peer)
-			}
-		}
-	}()
+	go roster.keepRegistered(quit, nil)
+	go roster.followStream(quit, nil)
 
 	// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing.
 	var virtualIPMap sync.Map
@@ -333,9 +247,7 @@ func runSessionDaemon(p daemonParams) {
 					return true
 				})
 				writePeers(&virtualIPMap)
-				peersMu.Lock()
-				delete(knownPeers, addr.String())
-				peersMu.Unlock()
+				roster.forget(addr)
 			}
 		}
 	}()

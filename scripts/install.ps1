@@ -29,6 +29,73 @@ $Link.Description       = "Blindspot - P2P VPN tray"
 if ($IconPath) { $Link.IconLocation = "$IconPath,0" }
 $Link.Save()
 
+# --- Tor ---------------------------------------------------------------------
+#
+# 'blindspot connect' runs Tor as a subprocess to reach a room's onion service.
+# Windows has no package manager that reliably carries Tor, so fetch the Tor
+# Project's official Expert Bundle and drop tor.exe beside the CLI, at
+# "$Dir\tor\tor.exe" — the location blindspot checks before falling back to PATH.
+#
+# The Windows tor.exe is statically linked, so it needs no DLLs alongside it.
+#
+# 'blindspot rendezvous' does not need Tor, so failures here are warnings.
+
+function Get-LatestTorVersion {
+    # The Expert Bundle has no "latest" alias, so read the version directories
+    # out of the distribution index and take the highest.
+    try {
+        $index = Invoke-WebRequest -Uri "https://dist.torproject.org/torbrowser/" -UseBasicParsing -ErrorAction Stop
+        $versions = [regex]::Matches($index.Content, '>(\d+\.\d+(\.\d+)?)/<') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object { [version]$_ } -Descending
+        if ($versions.Count -gt 0) { return $versions[0] }
+    } catch { }
+    return $null
+}
+
+$TorExe = "$Dir\tor\tor.exe"
+if (Test-Path $TorExe) {
+    Write-Host "Tor already present at $TorExe"
+} elseif (Get-Command tor -ErrorAction SilentlyContinue) {
+    Write-Host "Tor already on PATH; leaving it alone."
+} else {
+    Write-Host ""
+    Write-Host "'blindspot connect' needs Tor; downloading the Tor Expert Bundle..."
+    try {
+        $ver = Get-LatestTorVersion
+        if (-not $ver) { throw "could not determine the latest Tor version" }
+
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "i686" }
+        $url  = "https://dist.torproject.org/torbrowser/$ver/tor-expert-bundle-windows-$arch-$ver.tar.gz"
+
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("tor-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $tarball = Join-Path $tmp "teb.tar.gz"
+
+        Invoke-WebRequest -Uri $url -OutFile $tarball -ErrorAction Stop
+        # tar ships with Windows 10 1803 and later.
+        tar -xzf $tarball -C $tmp
+        if ($LASTEXITCODE -ne 0) { throw "extracting the bundle failed" }
+
+        $src = Join-Path $tmp "tor\tor.exe"
+        if (-not (Test-Path $src)) { throw "tor.exe not found in the bundle" }
+
+        New-Item -ItemType Directory -Path "$Dir\tor" -Force | Out-Null
+        Copy-Item $src $TorExe -Force
+        # Ship the licence alongside it: Tor is 3-clause BSD, which requires the
+        # notice to travel with any redistributed binary.
+        $license = Join-Path $tmp "docs\tor.txt"
+        if (Test-Path $license) { Copy-Item $license "$Dir\tor\LICENSE-tor.txt" -Force }
+
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Tor $ver installed to $TorExe"
+    } catch {
+        Write-Host "warning: could not install Tor automatically ($($_.Exception.Message))."
+        Write-Host "         'blindspot connect' will not work until Tor is available;"
+        Write-Host "         'blindspot rendezvous' works without it."
+    }
+}
+
 Write-Host ""
 Write-Host "Installed to $Dir"
 Write-Host "  - CLI:  run 'blindspot' from any terminal"

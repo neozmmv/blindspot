@@ -77,14 +77,20 @@ func NormalizeHostname(hostname string, insecure bool) (string, error) {
 }
 
 func Register(hostname, sessionId, password, udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
-	return NewClient(normalizeScheme(hostname), sessionId, password, nil).Register(udpAddr, pubKey, create)
+	peers, _, err := NewClient(normalizeScheme(hostname), sessionId, password, nil).Register(udpAddr, pubKey, create)
+	return peers, err
 }
 
-// Register announces this peer and returns everyone already in the session.
-func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, error) {
+// Register announces this peer and returns everyone already in the session,
+// plus this peer's own join order.
+//
+// The index is what failover uses to stagger takeover attempts. Only the onion
+// room server reports it; the clearnet rendezvous server does not, so it is 0
+// there and unused.
+func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, int, error) {
 	hostname, sessionId, password := c.BaseURL, c.SessionID, c.Password
 	if strings.TrimSpace(sessionId) == "" {
-		return nil, fmt.Errorf("sessionId is required")
+		return nil, 0, fmt.Errorf("sessionId is required")
 	}
 
 	if password != "" && create {
@@ -94,20 +100,20 @@ func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, erro
 		})
 		res, err := c.HTTP.Post(fmt.Sprintf("%s/create_session", hostname), "application/json", bytes.NewBuffer(createBody))
 		if err != nil {
-			return nil, fmt.Errorf("failed to create session: %w", err)
+			return nil, 0, fmt.Errorf("failed to create session: %w", err)
 		}
 		defer res.Body.Close()
 		var createRes map[string]string
 		json.NewDecoder(res.Body).Decode(&createRes)
 		if createRes["error"] != "" && createRes["error"] != "session already exists" {
-			return nil, fmt.Errorf("failed to create session: %s", createRes["error"])
+			return nil, 0, fmt.Errorf("failed to create session: %s", createRes["error"])
 		}
 	}
 
 	parts := strings.Split(udpAddr, ":")
 	port, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse UDP address: %w", err)
+		return nil, 0, fmt.Errorf("failed to parse UDP address: %w", err)
 	}
 	localAddr := GetLocalAddr(port)
 
@@ -130,22 +136,23 @@ func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, erro
 
 	resp, err := c.HTTP.Post(endpoint, "application/json", bytes.NewBuffer(bodyJson))
 	if err != nil {
-		return nil, fmt.Errorf("failed to register: %w", err)
+		return nil, 0, fmt.Errorf("failed to register: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// server returns {"peers": [{"ip": "...", "local_addr": "...", "pub_key": "..."}]}
+	// server returns {"peers": [{"ip", "local_addr", "pub_key"}], "index": N}
 	var respBody struct {
 		Peers []struct {
 			IP        string `json:"ip"`
 			LocalAddr string `json:"local_addr"`
 			PubKey    string `json:"pub_key"`
 		} `json:"peers"`
+		Index int    `json:"index"`
 		Error string `json:"error"`
 	}
 	json.NewDecoder(resp.Body).Decode(&respBody)
 	if respBody.Error != "" {
-		return nil, fmt.Errorf("error from server: %s", respBody.Error)
+		return nil, 0, fmt.Errorf("error from server: %s", respBody.Error)
 	}
 
 	peers := make([]PeerAddr, len(respBody.Peers))
@@ -156,7 +163,7 @@ func (c *Client) Register(udpAddr, pubKey string, create bool) ([]PeerAddr, erro
 			PubKey: p.PubKey,
 		}
 	}
-	return peers, nil
+	return peers, respBody.Index, nil
 }
 
 func GetLocalAddr(remotePort int) string {

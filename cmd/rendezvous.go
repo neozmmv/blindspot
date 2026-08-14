@@ -99,7 +99,7 @@ var RendezvousCmd = &cobra.Command{
 		}
 
 		runSessionDaemon(daemonParams{
-			discovery:     session.NewClient(hostname, sessionId, password, nil),
+			discovery:     newDiscoveryRef(session.NewClient(hostname, sessionId, password, nil)),
 			createSession: isNew,
 			pskPassword:   password,
 			pskSessionID:  sessionId,

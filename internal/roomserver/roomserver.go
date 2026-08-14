@@ -181,7 +181,9 @@ func (s *Server) register(c *gin.Context) {
 
 	go rm.expirePeerAfterTTL(ctx, body.UdpAddr)
 
-	c.JSON(http.StatusOK, gin.H{"peers": existing})
+	// "index" is the caller's own join order. Peers need it to stagger failover
+	// attempts, and it cannot be read off "peers", which lists everyone else.
+	c.JSON(http.StatusOK, gin.H{"peers": existing, "index": index})
 }
 
 func (s *Server) stream(c *gin.Context) {

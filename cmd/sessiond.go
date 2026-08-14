@@ -30,8 +30,10 @@ import (
 // the packet pumps, stats and teardown — is identical either way, which is why
 // it lives here rather than being duplicated per command.
 type daemonParams struct {
-	// discovery announces this peer and reports the others.
-	discovery *session.Client
+	// discovery announces this peer and reports the others. It is a reference
+	// rather than a client so that an onion room can move hosting to another
+	// peer mid-session without tearing down the transport or the TUN device.
+	discovery *discoveryRef
 	// createSession maps to the rendezvous server's "create a password session"
 	// step. Onion rooms have no such concept and always pass false.
 	createSession bool
@@ -184,7 +186,8 @@ func runSessionDaemon(p daemonParams) {
 		}
 		exec.Command("route", "delete", "10.0.0.0", "mask", "255.0.0.0").Run() // best effort cleanup of route
 		if registered {
-			p.discovery.Leave(publicAddr)
+			cur, _ := p.discovery.current()
+			cur.Leave(publicAddr)
 		}
 		peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
 		peerConn.Close()         // stop handshake drivers/consumers and close the bind
@@ -199,12 +202,14 @@ func runSessionDaemon(p daemonParams) {
 		return
 	}
 
-	peers, err := p.discovery.Register(publicAddr, myPubKeyB64, p.createSession)
+	regClient, _ := p.discovery.current()
+	peers, selfIndex, err := regClient.Register(publicAddr, myPubKeyB64, p.createSession)
 	if err != nil {
 		writeStatus("error: " + err.Error())
 		return
 	}
 	registered = true
+	p.discovery.setSelfIndex(selfIndex)
 
 	myVirtualIP := bstun.VirtualIPv4(publicKey)
 	tunDevice, err = bstun.Create(myVirtualIP)
@@ -266,8 +271,19 @@ func runSessionDaemon(p daemonParams) {
 			select {
 			case <-quit:
 				return
+			case <-p.discovery.wakeCh():
+				// discovery moved to a new host; register there right away
+				cur, _ := p.discovery.current()
+				if current, idx, err := cur.Register(publicAddr, myPubKeyB64, false); err == nil {
+					p.discovery.setSelfIndex(idx)
+					for _, peer := range current {
+						addPeer(peer)
+					}
+				}
 			case <-ticker.C:
-				if current, err := p.discovery.Register(publicAddr, myPubKeyB64, false); err == nil {
+				cur, _ := p.discovery.current()
+				if current, idx, err := cur.Register(publicAddr, myPubKeyB64, false); err == nil {
+					p.discovery.setSelfIndex(idx)
 					for _, peer := range current {
 						addPeer(peer)
 					}
@@ -276,10 +292,19 @@ func runSessionDaemon(p daemonParams) {
 		}
 	}()
 
-	peerStream := p.discovery.StreamPeers(publicAddr, quit)
+	// The stream is re-established whenever discovery is swapped, so a handover
+	// to a new host reconnects instead of silently going deaf on the old one.
 	go func() {
-		for peer := range peerStream {
-			addPeer(peer)
+		for {
+			select {
+			case <-quit:
+				return
+			default:
+			}
+			cur, superseded := p.discovery.current()
+			for peer := range cur.StreamPeers(publicAddr, anyClosed(quit, superseded)) {
+				addPeer(peer)
+			}
 		}
 	}()
 

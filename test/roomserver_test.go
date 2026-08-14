@@ -28,6 +28,7 @@ func newTestRoom(t *testing.T) *httptest.Server {
 
 type registerResp struct {
 	Peers []roomserver.Peer `json:"peers"`
+	Index int               `json:"index"`
 	Error string            `json:"error"`
 }
 
@@ -81,6 +82,34 @@ func TestRegisterReturnsOtherPeersOnly(t *testing.T) {
 	}
 	if second.Peers[0].PubKey != "key-a" {
 		t.Fatalf("pub_key not propagated, got %q", second.Peers[0].PubKey)
+	}
+}
+
+// A peer cannot read its own index out of "peers", which lists everyone else —
+// so the response has to report it directly. Failover staggers takeover by this
+// number, so without it every peer would act at once.
+func TestRegisterReportsCallersOwnIndex(t *testing.T) {
+	ts := newTestRoom(t)
+
+	first := register(t, ts.URL, "1.1.1.1:100", "key-a")
+	if first.Index != 0 {
+		t.Fatalf("first peer to join should be index 0, got %d", first.Index)
+	}
+
+	second := register(t, ts.URL, "2.2.2.2:200", "key-b")
+	if second.Index != 1 {
+		t.Fatalf("second peer should be index 1, got %d", second.Index)
+	}
+
+	// And it stays put across a keepalive, matching what others see.
+	again := register(t, ts.URL, "1.1.1.1:100", "key-a")
+	if again.Index != 0 {
+		t.Fatalf("re-registering changed the caller's own index to %d", again.Index)
+	}
+	for _, p := range second.Peers {
+		if p.IP == "1.1.1.1:100" && p.Index != first.Index {
+			t.Fatalf("peer sees index %d for a peer that was told %d", p.Index, first.Index)
+		}
 	}
 }
 

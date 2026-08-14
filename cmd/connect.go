@@ -2,11 +2,7 @@ package cmd
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -14,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cretz/bine/tor"
 	"github.com/neozmmv/blindspot/internal/roomkey"
 	"github.com/neozmmv/blindspot/internal/roomserver"
 	"github.com/neozmmv/blindspot/internal/session"
@@ -138,32 +133,43 @@ func runRoomDaemon(name, password string, upMbit int, statusFile string) {
 	}
 	torClient := &http.Client{Transport: transport, Timeout: roomProbeTimeout}
 
-	// Is somebody already hosting this room?
+	// Discovery always points at the room's derived address; only a peer that
+	// is itself hosting swaps to its local copy. Because the address never
+	// changes, clients need no reconfiguration when hosting moves.
+	ref := newDiscoveryRef(session.NewClient(onionURL, roomserver.RoomSessionID, "", torClient))
+	sup := &roomSupervisor{
+		tor:       t,
+		priv:      priv,
+		onionURL:  onionURL,
+		torClient: torClient,
+		ref:       ref,
+		progress:  progress,
+	}
+	defer sup.stopHosting()
+
 	progress("looking for an existing host at " + onionID + ".onion")
-	var discovery *session.Client
 	// hostedElsewhere also reports why it concluded the room was empty; it is
 	// dropped here to keep the CLI line readable. Worth routing to a debug log
 	// if false negatives (publishing over a live host) ever need diagnosing.
-	hosted, _ := hostedElsewhere(torClient, onionURL)
-	if hosted {
+	if hosted, _ := hostedElsewhere(torClient, onionURL); hosted {
 		progress("joining host at " + onionID + ".onion")
-		discovery = session.NewClient(onionURL, roomserver.RoomSessionID, "", torClient)
 	} else {
 		progress("no host found. publishing " + onionID + ".onion")
-		local, closeHost, err := becomeRoomHost(ctx, t, priv)
-		if err != nil {
+		if err := sup.startHosting(ctx); err != nil {
 			writeStatus("error: publishing room: " + err.Error())
 			return
 		}
-		defer closeHost()
 		progress("hosting room at " + onionID + ".onion")
-		// Talk to our own room over loopback rather than looping back out
-		// through Tor: same server, same state, without a pointless circuit.
-		discovery = session.NewClient(local, roomserver.RoomSessionID, "", http.DefaultClient)
 	}
 
+	// Watch for the host disappearing (or for losing a descriptor race while
+	// hosting) for as long as the session lives.
+	supQuit := make(chan struct{})
+	defer close(supQuit)
+	go sup.run(ctx, supQuit)
+
 	runSessionDaemon(daemonParams{
-		discovery: discovery,
+		discovery: ref,
 		// Onion rooms have no server-side session to create.
 		createSession: false,
 		// The PSK is derived from the same password as the onion address, so it
@@ -235,42 +241,6 @@ func hostedElsewhere(client *http.Client, onionURL string) (bool, string) {
 // only costs the slower timeout path.
 func isOnionUnreachable(err error) bool {
 	return strings.Contains(err.Error(), "host unreachable")
-}
-
-// becomeRoomHost publishes the onion service and serves the room API on it. The
-// same handler is also served on a loopback listener, whose base URL is
-// returned, so the hosting peer can register with its own room directly.
-func becomeRoomHost(ctx context.Context, t *tor.Tor, priv ed25519.PrivateKey) (string, func(), error) {
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return "", nil, fmt.Errorf("generating host nonce: %w", err)
-	}
-	srv := roomserver.New(getVersion(), hex.EncodeToString(nonce))
-	handler := srv.Handler()
-
-	loopback, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", nil, fmt.Errorf("opening local room listener: %w", err)
-	}
-
-	onionSvc, err := t.Listen(ctx, &tor.ListenConf{
-		Key:         priv,
-		Version3:    true,
-		RemotePorts: []int{80},
-	})
-	if err != nil {
-		loopback.Close()
-		return "", nil, fmt.Errorf("publishing onion service: %w", err)
-	}
-
-	go http.Serve(onionSvc, handler)
-	go http.Serve(loopback, handler)
-
-	closeHost := func() {
-		onionSvc.Close()
-		loopback.Close()
-	}
-	return "http://" + loopback.Addr().String(), closeHost, nil
 }
 
 func init() {

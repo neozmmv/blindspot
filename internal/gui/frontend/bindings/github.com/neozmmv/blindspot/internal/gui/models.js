@@ -185,6 +185,21 @@ export class Status {
              */
             this["incoming"] = null;
         }
+        if (!("progress" in $$source)) {
+            /**
+             * Progress is the latest line printed by a connect that is still running.
+             * A room connect bootstraps Tor and publishes or fetches a descriptor before
+             * it can report anything, which was measured at anywhere from ~28s to ~187s;
+             * without this the panel would sit on "Connecting…" for minutes with no sign
+             * of life. Empty when nothing is connecting.
+             *
+             * New fields belong at the end: the generated frontend bindings address
+             * struct members by position.
+             * @member
+             * @type {string}
+             */
+            this["progress"] = "";
+        }
 
         Object.assign(this, $$source);
     }

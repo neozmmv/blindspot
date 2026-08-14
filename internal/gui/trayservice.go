@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 
+	"github.com/neozmmv/blindspot/internal/roomkey"
 	"github.com/neozmmv/blindspot/internal/transfer"
 	bstun "github.com/neozmmv/blindspot/internal/tun"
 	"github.com/neozmmv/blindspot/internal/utils"
@@ -52,6 +54,16 @@ type Status struct {
 	AwaitingAccept bool             `json:"awaitingAccept"` // sender: waiting for a peer to accept
 	AwaitingPeer   string           `json:"awaitingPeer"`   // sender: peer we're waiting on
 	Incoming       *IncomingRequest `json:"incoming"`       // receiver: pending inbound request, if any
+
+	// Progress is the latest line printed by a connect that is still running.
+	// A room connect bootstraps Tor and publishes or fetches a descriptor before
+	// it can report anything, which was measured at anywhere from ~28s to ~187s;
+	// without this the panel would sit on "Connecting…" for minutes with no sign
+	// of life. Empty when nothing is connecting.
+	//
+	// New fields belong at the end: the generated frontend bindings address
+	// struct members by position.
+	Progress string `json:"progress"`
 }
 
 // IncomingRequest is a pending inbound file offer surfaced to the frontend as an
@@ -71,6 +83,7 @@ type TrayService struct {
 	mu         sync.Mutex
 	busy       bool
 	transfer   string
+	progress   string             // latest line from a connect in flight
 	session    string             // the session name this tray connected to, if any
 	receiver   *transfer.Receiver // in-process receive listener, while a receive is running
 	recvCancel context.CancelFunc // cancels the running receive
@@ -166,6 +179,7 @@ func (s *TrayService) GetStatus() Status {
 	}
 	s.mu.Lock()
 	busy, transfer, receiving, session := s.busy, s.transfer, s.receiver != nil, s.session
+	progress := s.progress
 	awaitingPeer := s.awaitingPeer
 	var incoming *IncomingRequest
 	if s.pendingIn != nil {
@@ -191,6 +205,7 @@ func (s *TrayService) GetStatus() Status {
 		AwaitingAccept: awaitingPeer != "",
 		AwaitingPeer:   awaitingPeer,
 		Incoming:       incoming,
+		Progress:       progress,
 	}
 }
 
@@ -216,6 +231,21 @@ func (s *TrayService) setTransfer(msg string) {
 	s.emit()
 }
 
+// setProgress publishes the latest line from a connect in flight. The CLI
+// indents its progress steps; that reads as a transcript in a terminal but as
+// stray whitespace in the panel, so it is trimmed.
+func (s *TrayService) setProgress(line string) {
+	line = strings.TrimSpace(line)
+	s.mu.Lock()
+	if s.progress == line {
+		s.mu.Unlock()
+		return
+	}
+	s.progress = line
+	s.mu.Unlock()
+	s.emit()
+}
+
 // clearTransferAfter blanks the transfer line after d — but only if it still shows
 // msg and no receive is running, so a newer transfer's status is never wiped.
 func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
@@ -236,50 +266,95 @@ func (s *TrayService) clearTransferAfter(msg string, d time.Duration) {
 	}()
 }
 
-// Connect runs `blindspot rendezvous -s <session> -p <password> [-n] [-H <hostname>]`,
-// which triggers the UAC elevation + daemon launch and blocks until the session is
-// up (or fails). A non-empty hostname overrides the default rendezvous server. It
-// returns the final status line the CLI printed.
-func (s *TrayService) Connect(session, password string, isNew bool, hostname string) (string, error) {
+// Connection modes, matching the two ways peers find each other. Room is the
+// default and needs no server of any kind; rendezvous is the server-based flow
+// and the only one where a hostname means anything.
+const (
+	ModeRoom       = "room"
+	ModeRendezvous = "rendezvous"
+)
+
+// Connect starts a session, triggering the UAC elevation + daemon launch, and
+// blocks until the session is up (or fails). It returns the final status line
+// the CLI printed.
+//
+// mode selects the command:
+//
+//	room        `blindspot connect <name> <password>` — serverless. The pair
+//	            derives a Tor onion address that every peer computes for itself,
+//	            so isNew and hostname have no meaning and are ignored.
+//	rendezvous  `blindspot rendezvous -s … [-p …] [-n] [-H …]` — via the
+//	            signaling server, optionally a custom one.
+//
+// Output is streamed rather than collected, because a room connect can spend
+// minutes bootstrapping Tor before it has anything to report.
+func (s *TrayService) Connect(mode, session, password string, isNew bool, hostname string) (string, error) {
 	session = strings.TrimSpace(session)
 	if session == "" {
-		return "", fmt.Errorf("session name is required")
-	}
-	if isNew && len(password) < 8 {
-		return "", fmt.Errorf("a new session needs a password of at least 8 characters")
+		return "", fmt.Errorf("network name is required")
 	}
 	if s.sessionRunning() {
 		return "", fmt.Errorf("already connected — disconnect first")
 	}
 
-	args := []string{"rendezvous", "-s", session}
-	if password != "" {
-		args = append(args, "-p", password)
-	}
-	if isNew {
-		args = append(args, "-n")
-	}
-	if hostname = strings.TrimSpace(hostname); hostname != "" {
-		args = append(args, "-H", hostname)
+	var args []string
+	switch mode {
+	case ModeRendezvous:
+		if isNew && len(password) < 8 {
+			return "", fmt.Errorf("a new session needs a password of at least 8 characters")
+		}
+		args = []string{"rendezvous", "-s", session}
+		if password != "" {
+			args = append(args, "-p", password)
+		}
+		if isNew {
+			args = append(args, "-n")
+		}
+		if hostname = strings.TrimSpace(hostname); hostname != "" {
+			args = append(args, "-H", hostname)
+		}
+	case ModeRoom, "": // empty: a frontend from before the selector existed
+		// The same rules the CLI enforces, checked here so a bad name or a weak
+		// password is reported instantly instead of after a 512 MiB key
+		// derivation and a Tor bootstrap.
+		if err := roomkey.Validate(session, password); err != nil {
+			return "", err
+		}
+		args = []string{"connect", session, password}
+	default:
+		return "", fmt.Errorf("unknown connection mode %q", mode)
 	}
 
 	s.setBusy(true)
-	defer s.setBusy(false)
+	defer func() {
+		s.setProgress("")
+		s.setBusy(false)
+	}()
 
-	out, err := s.runCLI(args...)
-	if err == nil && s.sessionRunning() {
+	out, err := s.runCLIStreaming(s.setProgress, args...)
+
+	// The CLI exits 0 even when it reports a failure or gives up waiting, so
+	// whether a session is actually running on disk is the real verdict. Only
+	// the last line is surfaced: a room connect prints a running commentary, and
+	// all of it in one toast would bury the outcome.
+	connected := s.sessionRunning()
+	if connected {
 		s.mu.Lock()
 		s.session = session
 		s.mu.Unlock()
 	}
 	s.emit()
+
+	if err == nil && connected {
+		return lastLine(out), nil
+	}
+	if out != "" {
+		return "", fmt.Errorf("%s", lastLine(out))
+	}
 	if err != nil {
-		if out != "" {
-			return "", fmt.Errorf("%s", out)
-		}
 		return "", err
 	}
-	return out, nil
+	return "", fmt.Errorf("could not connect")
 }
 
 // Disconnect signals the running daemon to stop (the same mechanism as
@@ -451,7 +526,7 @@ func (s *TrayService) StartReceive(here bool) error {
 func (s *TrayService) startReceiver(here bool) error {
 	ip := s.MyIP()
 	if ip == "" {
-		return fmt.Errorf("no identity found. Run 'blindspot rendezvous' first")
+		return fmt.Errorf("no identity found. Connect to a network first")
 	}
 
 	var destDir string
@@ -561,6 +636,52 @@ func (s *TrayService) runCLI(args ...string) (string, error) {
 	hideConsole(cmd)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// runCLIStreaming is runCLI for commands worth watching: onLine is called with
+// each line as it is printed, and the whole output is still returned at the end.
+//
+// It exists for the room connect, which can spend minutes in Tor's bootstrap.
+// CombinedOutput would hand all of that over at once, long after the user has
+// concluded the panel is stuck.
+func (s *TrayService) runCLIStreaming(onLine func(string), args ...string) (string, error) {
+	cmd := exec.Command(cliExe(), args...)
+	hideConsole(cmd)
+
+	pr, pw := io.Pipe()
+	cmd.Stdout, cmd.Stderr = pw, pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
+		return "", err
+	}
+
+	// Wait closes the write half, which ends the scan below. It runs in its own
+	// goroutine because it cannot return until the output is drained here.
+	waited := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		pw.Close()
+		waited <- err
+	}()
+
+	var lines []string
+	sc := bufio.NewScanner(pr)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+		if onLine != nil {
+			onLine(line)
+		}
+	}
+	// Unblocks the copy if the scan stopped early (a line over the scanner's
+	// limit); a no-op on the normal path, where the pipe is already at EOF.
+	pr.Close()
+
+	return strings.Join(lines, "\n"), <-waited
 }
 
 func lastLine(s string) string {

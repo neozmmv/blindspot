@@ -22,7 +22,7 @@ var identityStatusCmd = &cobra.Command{
 	Short: "Show whether the identity is encrypted at rest",
 	Run: func(cmd *cobra.Command, args []string) {
 		if !utils.IdentityExists() {
-			fmt.Println("No identity found. Run 'blindspot rendezvous' or 'blindspot ip' to create one.")
+			fmt.Println("No identity found. Run 'blindspot connect' or 'blindspot ip' to create one.")
 			return
 		}
 		encrypted, err := utils.IsIdentityEncrypted()

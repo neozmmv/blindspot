@@ -31,7 +31,8 @@ $Link.Save()
 
 # --- Tor ---------------------------------------------------------------------
 #
-# 'blindspot connect' runs Tor as a subprocess to reach a room's onion service.
+# 'blindspot connect' and 'blindspot chat' run Tor as a subprocess to reach a
+# room's onion service.
 # Windows has no package manager that reliably carries Tor, so fetch the Tor
 # Project's official Expert Bundle and drop tor.exe beside the CLI, at
 # "$Dir\tor\tor.exe" — the location blindspot checks before falling back to PATH.
@@ -91,8 +92,8 @@ if (Test-Path $TorExe) {
         Write-Host "Tor $ver installed to $TorExe"
     } catch {
         Write-Host "warning: could not install Tor automatically ($($_.Exception.Message))."
-        Write-Host "         'blindspot connect' will not work until Tor is available;"
-        Write-Host "         'blindspot rendezvous' works without it."
+        Write-Host "         'blindspot connect' and 'blindspot chat' will not work"
+        Write-Host "         until Tor is available; 'blindspot rendezvous' works without it."
     }
 }
 

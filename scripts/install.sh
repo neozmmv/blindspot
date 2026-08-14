@@ -35,10 +35,11 @@ echo "installed to $INSTALL_DIR/blindspot"
 
 # --- Tor -------------------------------------------------------------------
 #
-# 'blindspot connect' runs Tor as a subprocess to reach a room's onion service.
-# It looks for a bundled copy next to the binary first, then falls back to one
-# on PATH — which is what this installs. 'blindspot rendezvous' does not need
-# Tor at all, so a failure here is a warning, not a fatal error.
+# 'blindspot connect' and 'blindspot chat' run Tor as a subprocess to reach a
+# room's onion service. They look for a bundled copy next to the binary first,
+# then fall back to one on PATH — which is what this installs. 'blindspot
+# rendezvous' does not need Tor at all, so a failure here is a warning, not a
+# fatal error.
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -66,7 +67,9 @@ install_tor() {
     fi
 }
 
-if command -v tor >/dev/null 2>&1; then
+if [ -x "$INSTALL_DIR/tor/tor" ]; then
+    echo "tor already present alongside blindspot"
+elif command -v tor >/dev/null 2>&1; then
     echo "tor already present: $(command -v tor)"
 else
     echo ""
@@ -84,7 +87,7 @@ else
         fi
     else
         echo "warning: could not detect a supported package manager."
-        echo "         install Tor manually for 'blindspot connect' — 'blindspot"
-        echo "         rendezvous' works without it."
+        echo "         install Tor manually for 'blindspot connect' and"
+        echo "         'blindspot chat' — 'blindspot rendezvous' works without it."
     fi
 fi

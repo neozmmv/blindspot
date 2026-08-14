@@ -153,7 +153,7 @@ Pre-built binaries are also available directly on the [releases page](https://gi
 
 ### Tor
 
-`connect` and `chat` run Tor as a subprocess — it is not linked into the binary. Blindspot looks for a bundled copy at `tor/tor` (or `tor\tor.exe`) next to the `blindspot` executable first, then for one on `PATH`. The install scripts above set this up for you; a manual install or `go install` needs a system Tor:
+`connect` and `chat` run Tor as a subprocess — it is not linked into the binary. Blindspot looks for a bundled copy at `tor/tor` (or `tor\tor.exe`) next to the `blindspot` executable first, then for one on `PATH`. The install scripts above set this up for you, and `blindspot update` installs Tor too if the machine still has none. A manual install or `go install` needs a system Tor:
 
 ```bash
 sudo apt install tor      # or dnf/pacman/zypper/apk

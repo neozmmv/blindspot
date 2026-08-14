@@ -22,7 +22,7 @@ var ReceiveCmd = &cobra.Command{
 		// read just the public key — no passphrase required even if encrypted.
 		publicKey, err := utils.ReadPublicKey()
 		if err != nil {
-			fmt.Println("No identity found. Run 'blindspot connect' first.")
+			fmt.Println("No identity found. Run 'blindspot connect' or 'blindspot ip' to create one.")
 			return
 		}
 

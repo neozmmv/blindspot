@@ -20,6 +20,7 @@ P2P Toolkit: VPN, File Sharing, Chat, and More
 
 func init() {
 	rootCmd.AddCommand(ConnectCmd)
+	rootCmd.AddCommand(RendezvousCmd)
 	rootCmd.AddCommand(DisconnectCmd)
 	rootCmd.AddCommand(ListCmd)
 	rootCmd.AddCommand(ChatCmd)

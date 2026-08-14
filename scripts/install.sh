@@ -32,3 +32,62 @@ else
 fi
 
 echo "installed to $INSTALL_DIR/blindspot"
+
+# --- Tor -------------------------------------------------------------------
+#
+# 'blindspot connect' and 'blindspot chat' run Tor as a subprocess to reach a
+# room's onion service. They look for a bundled copy next to the binary first,
+# then fall back to one on PATH — which is what this installs. 'blindspot
+# rendezvous' does not need Tor at all, so a failure here is a warning, not a
+# fatal error.
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+install_tor() {
+    if command -v apt-get >/dev/null 2>&1; then
+        as_root apt-get update -qq && as_root apt-get install -y tor
+    elif command -v dnf >/dev/null 2>&1; then
+        as_root dnf install -y tor
+    elif command -v yum >/dev/null 2>&1; then
+        as_root yum install -y tor
+    elif command -v pacman >/dev/null 2>&1; then
+        as_root pacman -Sy --noconfirm tor
+    elif command -v zypper >/dev/null 2>&1; then
+        as_root zypper --non-interactive install tor
+    elif command -v apk >/dev/null 2>&1; then
+        as_root apk add --no-cache tor
+    else
+        return 1
+    fi
+}
+
+if [ -x "$INSTALL_DIR/tor/tor" ]; then
+    echo "tor already present alongside blindspot"
+elif command -v tor >/dev/null 2>&1; then
+    echo "tor already present: $(command -v tor)"
+else
+    echo ""
+    echo "'blindspot connect' needs Tor; installing it..."
+    # Not under 'set -e': blindspot is already installed and usable without Tor.
+    if install_tor; then
+        if command -v tor >/dev/null 2>&1; then
+            echo "tor installed: $(command -v tor)"
+            # Debian and Ubuntu enable and start tor.service on install. Blindspot
+            # spawns its own instance on its own control port and does not use the
+            # system service, so it can be disabled if it is not otherwise wanted:
+            #   sudo systemctl disable --now tor
+        else
+            echo "warning: the tor package installed but 'tor' is not on PATH."
+        fi
+    else
+        echo "warning: could not detect a supported package manager."
+        echo "         install Tor manually for 'blindspot connect' and"
+        echo "         'blindspot chat' — 'blindspot rendezvous' works without it."
+    fi
+fi

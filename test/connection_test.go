@@ -203,13 +203,21 @@ func newTestPeer(t *testing.T, sessionID, password string) *testPeer {
 
 func newTestPeerWithKey(t *testing.T, sessionID, password string, kp *crypto.KeyPair) *testPeer {
 	t.Helper()
+	return newTestPeerWithPrologue(t, sessionID, password, kp, network.Prologue(sessionID))
+}
+
+// newTestPeerWithPrologue is newTestPeerWithKey with the handshake prologue
+// spelled out, so tests can pair peers that disagree about it — which is how
+// chat and VPN peers are kept from ever establishing a session.
+func newTestPeerWithPrologue(t *testing.T, sessionID, password string, kp *crypto.KeyPair, prologue []byte) *testPeer {
+	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP: %v", err)
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", conn.LocalAddr().(*net.UDPAddr).Port)
 	psk := crypto.DerivePSK(password, sessionID)
-	pc := network.NewPeerConn(network.WrapUDPConn(conn), kp.PrivateKey, kp.PublicKey, psk, network.Prologue(sessionID))
+	pc := network.NewPeerConn(network.WrapUDPConn(conn), kp.PrivateKey, kp.PublicKey, psk, prologue)
 	return &testPeer{
 		conn:   conn,
 		addr:   addr,

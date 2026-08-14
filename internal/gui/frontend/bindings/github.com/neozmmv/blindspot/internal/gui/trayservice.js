@@ -49,18 +49,29 @@ export function CancelSend() {
 }
 
 /**
- * Connect runs `blindspot connect -s <session> -p <password> [-n] [-H <hostname>]`,
- * which triggers the UAC elevation + daemon launch and blocks until the session is
- * up (or fails). A non-empty hostname overrides the default rendezvous server. It
- * returns the final status line the CLI printed.
+ * Connect starts a session, triggering the UAC elevation + daemon launch, and
+ * blocks until the session is up (or fails). It returns the final status line
+ * the CLI printed.
+ *
+ * mode selects the command:
+ *
+ *	room        `blindspot connect <name> <password>` — serverless. The pair
+ *	            derives a Tor onion address that every peer computes for itself,
+ *	            so isNew and hostname have no meaning and are ignored.
+ *	rendezvous  `blindspot rendezvous -s … [-p …] [-n] [-H …]` — via the
+ *	            signaling server, optionally a custom one.
+ *
+ * Output is streamed rather than collected, because a room connect can spend
+ * minutes bootstrapping Tor before it has anything to report.
+ * @param {string} mode
  * @param {string} session
  * @param {string} password
  * @param {boolean} isNew
  * @param {string} hostname
  * @returns {$CancellablePromise<string>}
  */
-export function Connect(session, password, isNew, hostname) {
-    return $Call.ByID(1698713851, session, password, isNew, hostname);
+export function Connect(mode, session, password, isNew, hostname) {
+    return $Call.ByID(1698713851, mode, session, password, isNew, hostname);
 }
 
 /**

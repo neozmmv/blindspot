@@ -25,6 +25,7 @@ interface Status {
   awaitingAccept: boolean
   awaitingPeer: string
   incoming: IncomingRequest | null
+  progress: string
 }
 
 const emptyStatus: Status = {
@@ -38,7 +39,22 @@ const emptyStatus: Status = {
   awaitingAccept: false,
   awaitingPeer: '',
   incoming: null,
+  progress: '',
 }
+
+/*
+ * How peers find each other. Serverless is the default: the network name and
+ * password derive a Tor address every peer computes on its own, so there is no
+ * server to run or trust — at the cost of a slow start while Tor bootstraps.
+ * Rendezvous is the original server-based flow, and the only one that can point
+ * at a custom host.
+ */
+type Mode = 'room' | 'rendezvous'
+
+/* Kept in step with internal/roomkey: a room's password is the only thing
+ * protecting it, and guessing is an offline exercise nobody can rate-limit. */
+const MIN_ROOM_NAME = 4
+const MIN_ROOM_PASSWORD = 8
 
 /* Minimal line icons, sized by the surrounding font. */
 const stroke = {
@@ -73,6 +89,7 @@ const IconPower = () => (
 function App() {
   const [status, setStatus] = useState<Status>(emptyStatus)
   const [notice, setNotice] = useState('')
+  const [mode, setMode] = useState<Mode>('room')
   const [session, setSession] = useState('')
   const [password, setPassword] = useState('')
   const [isNew, setIsNew] = useState(false)
@@ -115,11 +132,21 @@ function App() {
     ;(flash as any)._t = window.setTimeout(() => setNotice(''), 5000)
   }
 
+  /* What still has to be filled in before Connect can do anything. A serverless
+   * room has no session to create and no host to point at, so those inputs are
+   * hidden rather than ignored; its password, by contrast, is mandatory. */
+  const roomReady =
+    session.trim().length >= MIN_ROOM_NAME && password.length >= MIN_ROOM_PASSWORD
+  const rendezvousReady =
+    session.trim().length > 0 && (!isNew || password.length >= 8)
+  const canConnect = !status.busy && (mode === 'room' ? roomReady : rendezvousReady)
+
   const doConnect = async () => {
+    if (!canConnect) return
     setNotice('')
     try {
-      const rendezvous = useCustomRendezvous ? hostname : ''
-      const msg = await TrayService.Connect(session, password, isNew, rendezvous)
+      const rendezvous = mode === 'rendezvous' && useCustomRendezvous ? hostname : ''
+      const msg = await TrayService.Connect(mode, session, password, isNew, rendezvous)
       flash(msg || 'Connected.')
       setPassword('')
     } catch (e: any) {
@@ -292,62 +319,112 @@ function App() {
         <main className="content">
           <section className="card connect-card">
             <h1 className="connect-title">Connect to a network</h1>
-            <p className="connect-sub">Join a session or create a new encrypted network.</p>
+            <p className="connect-sub">
+              {mode === 'room'
+                ? 'Everyone who knows the name and password ends up on the same network. No server involved.'
+                : 'Join a session or create a new encrypted network through a signaling server.'}
+            </p>
+
+            <div className="mode-switch" role="radiogroup" aria-label="How peers find each other">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={mode === 'room'}
+                className={`mode-option${mode === 'room' ? ' is-active' : ''}`}
+                onClick={() => setMode('room')}
+              >
+                Serverless
+                <span className="mode-sub">over Tor</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={mode === 'rendezvous'}
+                className={`mode-option${mode === 'rendezvous' ? ' is-active' : ''}`}
+                onClick={() => setMode('rendezvous')}
+              >
+                Rendezvous
+                <span className="mode-sub">via a server</span>
+              </button>
+            </div>
 
             <label className="field-label" htmlFor="session">Network name</label>
             <input
               id="session"
               className="input"
-              placeholder="e.g. blindspot-friends"
+              placeholder={mode === 'room' ? 'At least 4 characters' : 'e.g. blindspot-friends'}
               value={session}
               onChange={(e) => setSession(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
+              onKeyDown={(e) => { if (e.key === 'Enter') doConnect() }}
               autoComplete="off"
               autoFocus
             />
 
-            <label className="field-label" htmlFor="password">Password{!isNew && <span className="optional"> (optional)</span>}</label>
+            <label className="field-label" htmlFor="password">
+              Password
+              {mode === 'rendezvous' && !isNew && <span className="optional"> (optional)</span>}
+            </label>
             <input
               id="password"
               className="input"
               type="password"
-              placeholder={isNew ? 'At least 8 characters' : 'Leave blank if none'}
+              placeholder={
+                mode === 'room'
+                  ? 'At least 8 characters — prefer a passphrase'
+                  : isNew ? 'At least 8 characters' : 'Leave blank if none'
+              }
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
+              onKeyDown={(e) => { if (e.key === 'Enter') doConnect() }}
               autoComplete="off"
             />
 
-            <label className="checkbox">
-              <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
-              <span>Create a new encrypted network</span>
-            </label>
+            {/* Neither option exists for a room: there is no session to create,
+                and no server to point somewhere else. */}
+            {mode === 'rendezvous' && (
+              <>
+                <label className="checkbox">
+                  <input type="checkbox" checked={isNew} onChange={(e) => setIsNew(e.target.checked)} />
+                  <span>Create a new encrypted network</span>
+                </label>
 
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={useCustomRendezvous}
-                onChange={(e) => setUseCustomRendezvous(e.target.checked)}
-              />
-              <span>Use a custom rendezvous server</span>
-            </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={useCustomRendezvous}
+                    onChange={(e) => setUseCustomRendezvous(e.target.checked)}
+                  />
+                  <span>Use a custom rendezvous server</span>
+                </label>
 
-            {useCustomRendezvous && (
-              <input
-                id="hostname"
-                className="input"
-                placeholder="e.g. rendezvous.trycloudflare.com"
-                value={hostname}
-                onChange={(e) => setHostname(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && session) doConnect() }}
-                autoComplete="off"
-              />
+                {useCustomRendezvous && (
+                  <input
+                    id="hostname"
+                    className="input"
+                    placeholder="e.g. rendezvous.trycloudflare.com"
+                    value={hostname}
+                    onChange={(e) => setHostname(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') doConnect() }}
+                    autoComplete="off"
+                  />
+                )}
+              </>
             )}
 
-            <button className="btn btn-primary btn-full" onClick={doConnect} disabled={status.busy || !session}>
+            <button className="btn btn-primary btn-full" onClick={doConnect} disabled={!canConnect}>
               {status.busy ? 'Connecting…' : 'Connect'}
             </button>
-            <p className="connect-note">Connecting requires administrator access to set up the VPN adapter.</p>
+
+            {/* A room connect spends its first minutes in Tor's bootstrap with
+                nothing else to show, so the CLI's running commentary goes here. */}
+            {status.busy && status.progress && (
+              <p className="connect-progress" role="status">{status.progress}</p>
+            )}
+
+            <p className="connect-note">
+              Connecting requires administrator access to set up the VPN adapter.
+              {mode === 'room' && ' The first peer to arrive hosts the network; starting Tor can take a minute or two.'}
+            </p>
           </section>
 
           <div className="device-line">

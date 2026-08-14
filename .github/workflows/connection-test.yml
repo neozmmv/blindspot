@@ -1,6 +1,10 @@
 name: blindspot Connection Test
 
-# Tests that two real peers can find each other via the rendezvous server.
+# Tests that two real peers can find each other via the rendezvous server, on
+# two separate runners — so this is also the NAT-traversal test.
+#
+# The serverless room path ('connect' / 'chat', discovery over Tor) is covered
+# by room-test.yml, and the offline tests by test.yml.
 
 on:
   workflow_dispatch:
@@ -23,7 +27,7 @@ jobs:
         run: go build -o blindspot .
 
       - name: Connect
-        run: sudo ./blindspot connect -s ci-nopass-${{ github.run_id }}
+        run: sudo ./blindspot rendezvous -s ci-nopass-${{ github.run_id }}
 
       - name: Wait for peer B (blindspot list)
         run: |
@@ -60,7 +64,7 @@ jobs:
         run: go build -o blindspot .
 
       - name: Connect
-        run: sudo ./blindspot connect -s ci-nopass-${{ github.run_id }}
+        run: sudo ./blindspot rendezvous -s ci-nopass-${{ github.run_id }}
 
       - name: Wait for peer A (blindspot list)
         run: |
@@ -99,7 +103,7 @@ jobs:
         run: go build -o blindspot .
 
       - name: Create session and connect
-        run: sudo ./blindspot connect -s ci-pass-${{ github.run_id }} -n -p "CItest1234!"
+        run: sudo ./blindspot rendezvous -s ci-pass-${{ github.run_id }} -n -p "CItest1234!"
 
       - name: Wait for peer B (blindspot list)
         run: |
@@ -145,7 +149,7 @@ jobs:
       - name: Join session and connect
         run: |
           for i in $(seq 1 8); do
-            if sudo ./blindspot connect -s ci-pass-${{ github.run_id }} -p "CItest1234!"; then
+            if sudo ./blindspot rendezvous -s ci-pass-${{ github.run_id }} -p "CItest1234!"; then
               exit 0
             fi
             echo "attempt $i/8 failed, retrying in 15s..."

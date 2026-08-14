@@ -1,0 +1,39 @@
+name: blindspot Tests
+
+# Unit and integration tests: the Noise handshake and transport, the replay
+# window, the room server and its failover logic, file transfer, config and
+# identity handling. Everything here is deterministic and needs no network.
+#
+# The live end-to-end tests live elsewhere: connection-test.yml pairs two real
+# peers through the rendezvous server, and room-test.yml does the same through a
+# Tor room.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: go vet + go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+
+      # internal/gui and cmd/tray embed internal/gui/frontend/dist (//go:embed),
+      # which is gitignored and only exists after 'bun run build'. They are
+      # excluded here rather than pulling Bun into every test run; the release
+      # workflow builds the frontend and compiles both.
+      - name: Select packages
+        run: echo "PKGS=$(go list -e ./... | grep -vE 'internal/gui|cmd/tray' | tr '\n' ' ')" >> $GITHUB_ENV
+
+      - name: Vet
+        run: go vet $PKGS
+
+      - name: Test
+        run: go test -count=1 $PKGS

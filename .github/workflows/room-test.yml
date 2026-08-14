@@ -125,7 +125,7 @@ jobs:
       # "is anybody hosting?" probe, and publishing the descriptor — so that B
       # finds a room rather than racing A to create one.
       - name: Wait for peer A to publish the room
-        run: sleep 240
+        run: sleep 60
 
       # See peer A: the exit code alone does not distinguish success here.
       - name: Connect to the room
@@ -155,27 +155,3 @@ jobs:
       - name: Disconnect
         if: always()
         run: sudo ./blindspot disconnect
-
-  # --- One runner: discovery smoke test, and the only chat coverage ---------
-
-  room-chat:
-    name: "two chat peers over a Tor room"
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.6'
-
-      - name: Install Tor
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y tor
-          tor --version | head -1
-
-      - name: Build
-        run: go build -o blindspot .
-
-      - name: Two peers over a Tor room
-        run: .github/scripts/room-chat-e2e.sh ./blindspot

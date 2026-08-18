@@ -85,6 +85,7 @@ func superviseDaemon(successMsg string, startupTimeout time.Duration) {
 		child.Stdin = nil
 		child.Stdout = nil
 		child.Stderr = nil
+		detachDaemon(child)
 		if err := child.Start(); err != nil {
 			fmt.Println("Error starting background process:", err)
 			return
@@ -125,6 +126,30 @@ func superviseDaemon(successMsg string, startupTimeout time.Duration) {
 	}
 }
 
+// leaveTimeout bounds the "remove me from the room" request on the way out.
+//
+// For an onion room that request is a Tor round-trip on a client whose timeout
+// is roomProbeTimeout (75s) — far longer than the 10s `blindspot disconnect`
+// waits for the PID file to disappear before declaring the session unclean and
+// cleaning up under a daemon that is in fact still shutting down. Leaving is
+// best-effort anyway: peers that never see it drop us on keepalive timeout, and
+// the room expires the registration on its own TTL.
+const leaveTimeout = 5 * time.Second
+
+// leaveOnShutdown deregisters from discovery, giving up after leaveTimeout. The
+// goroutine outlives the wait, but only until the process exits moments later.
+func leaveOnShutdown(roster *peerRoster) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		roster.leave()
+	}()
+	select {
+	case <-done:
+	case <-time.After(leaveTimeout):
+	}
+}
+
 // runSessionDaemon owns the live session: it registers with the discovery
 // endpoint, brings up the TUN device, and pumps packets until quit. It returns
 // only once the session is torn down.
@@ -132,6 +157,12 @@ func runSessionDaemon(p daemonParams) {
 	pidFile := sessionPIDFile()
 	os.MkdirAll(filepath.Dir(pidFile), 0700)
 	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0600)
+	// A session that was killed rather than shut down leaves its peer list
+	// behind, and this one only rewrites the file once a peer connects. Clearing
+	// it up front stops `blindspot list` from reporting the previous session's
+	// peers — addresses nothing is listening on any more — as though they were
+	// live members of this one.
+	os.Remove(peersFile())
 
 	writeStatus := func(msg string) {
 		if p.statusFile != "" {
@@ -186,7 +217,7 @@ func runSessionDaemon(p daemonParams) {
 		}
 		exec.Command("route", "delete", "10.0.0.0", "mask", "255.0.0.0").Run() // best effort cleanup of route
 		if registered {
-			roster.leave()
+			leaveOnShutdown(roster)
 		}
 		peerConn.BroadcastDead() // encrypted "dead" notice so peers tear down promptly
 		peerConn.Close()         // stop handshake drivers/consumers and close the bind

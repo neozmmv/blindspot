@@ -30,14 +30,6 @@ type Identity struct {
 	PublicKey  string `json:"public_key"`            // base64; present in both forms
 }
 
-func GetBlindspotDir() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		panic(err)
-	}
-	return filepath.Join(homeDir, ".blindspot")
-}
-
 func identityPath() string {
 	return filepath.Join(GetBlindspotDir(), "identity.json")
 }
@@ -52,10 +44,6 @@ func writeIdentityFile(privateKey, publicKey, passphrase []byte) error {
 	if len(privateKey) != 32 || len(publicKey) != 32 {
 		return fmt.Errorf("invalid key length: private and public keys must be 32 bytes")
 	}
-	if err := os.MkdirAll(GetBlindspotDir(), 0700); err != nil {
-		return err
-	}
-
 	identity := Identity{PublicKey: base64.StdEncoding.EncodeToString(publicKey)}
 	if len(passphrase) > 0 {
 		salt := make([]byte, crypto.IdentitySaltLen)
@@ -81,7 +69,7 @@ func writeIdentityFile(privateKey, publicKey, passphrase []byte) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(identityPath(), data, 0600)
+	return WriteStateFile(identityPath(), data, 0600)
 }
 
 // WriteIdentity creates the identity file if it does not already exist, encrypting

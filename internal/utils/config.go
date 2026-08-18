@@ -33,12 +33,9 @@ func LoadConfig() Config {
 
 // SaveConfig writes the config file, creating ~/.blindspot if needed.
 func SaveConfig(c Config) error {
-	if err := os.MkdirAll(GetBlindspotDir(), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(), data, 0600)
+	return WriteStateFile(configPath(), data, 0600)
 }

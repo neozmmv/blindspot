@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/neozmmv/blindspot/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -20,7 +21,7 @@ var DisconnectCmd = &cobra.Command{
 			return
 		}
 
-		if err := os.WriteFile(stopFile, []byte("stop"), 0600); err != nil {
+		if err := utils.WriteStateFile(stopFile, []byte("stop"), 0600); err != nil {
 			fmt.Println("Error signaling daemon:", err)
 			return
 		}

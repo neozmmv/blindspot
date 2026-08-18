@@ -155,8 +155,7 @@ func leaveOnShutdown(roster *peerRoster) {
 // only once the session is torn down.
 func runSessionDaemon(p daemonParams) {
 	pidFile := sessionPIDFile()
-	os.MkdirAll(filepath.Dir(pidFile), 0700)
-	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0600)
+	utils.WriteStateFile(pidFile, fmt.Appendf(nil, "%d", os.Getpid()), 0600)
 	// A session that was killed rather than shut down leaves its peer list
 	// behind, and this one only rewrites the file once a peer connects. Clearing
 	// it up front stops `blindspot list` from reporting the previous session's
@@ -295,7 +294,7 @@ func runSessionDaemon(p daemonParams) {
 	// indicate session-level trouble.
 	go func() {
 		logPath := filepath.Join(utils.GetBlindspotDir(), "stats.log")
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		f, err := utils.CreateStateFile(logPath, 0600)
 		if err != nil {
 			return
 		}

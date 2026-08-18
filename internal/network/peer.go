@@ -79,12 +79,21 @@ const (
 // peerSession holds the per-peer handshake and transport state. All mutable
 // fields are guarded by mu.
 type peerSession struct {
-	mu           sync.Mutex
-	addr         *net.UDPAddr    // canonical remote address, for events and the public API
-	key          string          // canonical addr string; the sessions-map key
-	ep           wgconn.Endpoint // bind endpoint used for all sends to this peer
-	expected     []byte          // static key the rendezvous published for this peer (nil until known)
-	remoteStatic []byte          // authenticated static key after the handshake completes
+	mu   sync.Mutex
+	addr *net.UDPAddr    // canonical remote address, for events and the public API
+	key  string          // canonical addr string; the sessions-map key
+	ep   wgconn.Endpoint // bind endpoint used for all sends to this peer
+	// staticHex is the hex static key this session is pinned to, and the
+	// PeerConn.byStatic key. Unlike everything else here it is guarded by
+	// PeerConn.mu, not by mu: it is written only while the sessions map is being
+	// mutated (insert, re-index, rebind), so the index and the session it points
+	// at can never disagree. addr/key/ep above are written once at construction
+	// and never mutated — the receive path reads them without a lock, so moving
+	// a peer to a new address replaces the whole session rather than editing one
+	// in place (see handlePunch).
+	staticHex    string
+	expected     []byte // static key the rendezvous published for this peer (nil until known)
+	remoteStatic []byte // authenticated static key after the handshake completes
 	initiator    bool
 	hs           *noise.HandshakeState
 	established  bool
@@ -261,6 +270,11 @@ type PeerConn struct {
 	sessions     map[string]*peerSession // canonical addr string → session
 	knownStatics map[string]bool         // hex(static) → allowed; the session allowlist from the rendezvous
 	missedPings  map[string]int          // addr → consecutive unanswered pings
+	// byStatic indexes the same sessions by the peer's pinned static key, so an
+	// inbound punch naming that key can find the session no matter which address
+	// it is currently bound to. This is what lets a peer whose advertised
+	// address went stale be found again — see handlePunch.
+	byStatic map[string]*peerSession
 
 	Connected chan *net.UDPAddr // signals when a new peer completes the handshake
 	Dead      chan *net.UDPAddr // signals when a peer is declared dead
@@ -441,6 +455,7 @@ func NewPeerConn(t *Transport, privateKey, publicKey, psk, prologue []byte) *Pee
 		sessions:     map[string]*peerSession{},
 		knownStatics: map[string]bool{},
 		missedPings:  map[string]int{},
+		byStatic:     map[string]*peerSession{},
 		Connected:    make(chan *net.UDPAddr, 32),
 		Dead:         make(chan *net.UDPAddr, 10),
 		stop:         make(chan struct{}),
@@ -549,7 +564,7 @@ func (p *PeerConn) handlePacket(pkt []byte, ep wgconn.Endpoint) {
 	body := pkt[2:]
 	switch pktType {
 	case PacketPunch:
-		return
+		p.handlePunch(ep, body)
 	case PacketHandshakeInit:
 		p.handleHandshakeInit(ep, body)
 	case PacketHandshakeResp:
@@ -644,12 +659,14 @@ func (p *PeerConn) AddKnownPeer(addr *net.UDPAddr, remoteStatic []byte) error {
 	}
 
 	p.mu.Lock()
-	p.knownStatics[staticKeyHex(key)] = true
+	keyHex := staticKeyHex(key)
+	p.knownStatics[keyHex] = true
 	s, ok := p.sessions[sessKey]
 	if !ok {
 		s = &peerSession{addr: net.UDPAddrFromAddrPort(ap), key: sessKey, ep: ep}
 		p.sessions[sessKey] = s
 	}
+	p.indexStaticLocked(s, keyHex)
 	p.mu.Unlock()
 
 	s.mu.Lock()
@@ -676,8 +693,13 @@ func (p *PeerConn) AddKnownPeer(addr *net.UDPAddr, remoteStatic []byte) error {
 // armHandshakeLocked (re)builds the handshake state for a session toward the peer
 // with static key `key`, replacing any stale in-flight state, and returns the
 // generation the caller must pass to the driveHandshake goroutine it starts. It
-// must be called with s.mu held and only when the session is neither established
-// nor driving (driving is set here so a concurrent arm cannot double-start).
+// must be called with s.mu held and only when the session is not established.
+//
+// It sets driving and bumps driverGen, so a concurrent arm cannot double-start
+// and any driver already running is superseded on its next pass. Callers that
+// merely want to avoid redundant work (AddKnownPeer, rearmSession) check driving
+// first and skip; handlePunch deliberately does not, because superseding a
+// driver aimed at a stale address is the entire point of a rebind.
 func (p *PeerConn) armHandshakeLocked(s *peerSession, key []byte) (uint64, error) {
 	s.expected = key
 	s.hs = nil
@@ -726,7 +748,9 @@ func (p *PeerConn) driveHandshake(s *peerSession, gen uint64, deadline time.Time
 		}
 		s.mu.Unlock()
 	}()
-	punch := buildPacket(PacketPunch, nil)
+	// The punch names us, so a peer whose picture of our address is stale can
+	// correct it from the address this arrives on (see handlePunch).
+	punch := buildPacket(PacketPunch, p.static.Public)
 	interval := handshakeInterval
 	attempts := 0
 	for {
@@ -896,6 +920,118 @@ func parallelFor(n int, fn func(i int)) {
 	wg.Wait()
 }
 
+// handlePunch processes an inbound NAT hole-punch and, if it names a peer we
+// are trying to reach at some other address, moves that peer's session to the
+// address the punch arrived from.
+//
+// This is the only way a stale address can be corrected. A peer's advertised
+// address goes wrong for ordinary reasons — the mapping lapsed while it waited
+// for us, or the carrier rotated the port — and from then on every packet aimed
+// at it is discarded upstream. The source address of this datagram, by
+// contrast, is by construction a path that reaches the sender. The responder
+// side of a handshake has nothing else to go on: it sends only punches, and
+// msg2 from an unexpected address is dropped by design, so before this a
+// responder with a stale address could never converge.
+//
+// A punch may only *move* an unestablished session. It cannot create one, and
+// it is refused for an established one. The body is cleartext, so anything more
+// would let whoever knows a member's published static key redirect that
+// member's traffic; what the session is moved to still has to complete Noise
+// against the pinned static key and the PSK before it carries a single byte.
+func (p *PeerConn) handlePunch(ep wgconn.Endpoint, body []byte) {
+	// An older peer sends an empty punch. That carries no information, so it
+	// keeps its original meaning: it opened a mapping, and nothing more.
+	if len(body) != 32 || !p.isKnownStatic(body) {
+		return
+	}
+	newKey, ap, ok := canonEndpointKey(ep)
+	if !ok {
+		return
+	}
+	// A received source address is normally sane, but a spoofed punch would aim
+	// our handshake retransmits wherever it liked, so it passes the same filter
+	// as an address handed to us by the rendezvous.
+	addr := net.UDPAddrFromAddrPort(ap)
+	if !IsValidPeerAddr(addr) {
+		return
+	}
+
+	// Lock order is p.mu → s.mu, and only here: nothing in this file takes p.mu
+	// while holding a session's mu, which is what makes the nesting safe. The
+	// index lookup and the map surgery have to be atomic with respect to each
+	// other, or two punches arriving together could leave the session filed
+	// under an address it is no longer bound to.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.sessions[newKey]; exists {
+		return // already talking to this address; nothing to correct
+	}
+	keyHex := staticKeyHex(body)
+	old := p.byStatic[keyHex]
+	if old == nil || old.key == newKey {
+		return // no session pinned to this key yet, or already where it belongs
+	}
+
+	old.mu.Lock()
+	if old.established {
+		// There is a working authenticated path. A cleartext punch is not
+		// grounds to abandon it; if it really is dead the keepalive will time it
+		// out and re-arm on its own.
+		old.mu.Unlock()
+		return
+	}
+	remote := old.expected
+	if remote == nil {
+		remote = old.remoteStatic
+	}
+	old.mu.Unlock()
+	if remote == nil {
+		return // nothing pinned to hand the replacement handshake
+	}
+
+	newEp, err := p.bind.ParseEndpoint(newKey)
+	if err != nil {
+		return
+	}
+	// A fresh session rather than a re-pointed one: addr/key/ep are read without
+	// a lock on the receive path, so they are written once at construction and
+	// never mutated. Moving the peer means swapping which session the maps name.
+	//
+	// It is built and armed before the old one is touched, so a failure here
+	// leaves the existing session and its driver exactly as they were.
+	s := &peerSession{addr: addr, key: newKey, ep: newEp}
+	s.mu.Lock()
+	gen, err := p.armHandshakeLocked(s, remote)
+	s.mu.Unlock()
+	if err != nil {
+		return
+	}
+
+	old.mu.Lock()
+	// Re-check under the lock we just dropped: there is a receive loop per bind
+	// receive function, so the old session's handshake can have completed while
+	// the replacement was being built. Tearing it down then would orphan a live,
+	// authenticated session, which is far worse than an uncorrected address.
+	if old.established {
+		old.mu.Unlock()
+		return // the replacement was never published; dropping it is clean
+	}
+	// Supersede the driver still retransmitting at the old address: bumping
+	// driverGen is what its next pass checks, so it exits instead of punching at
+	// a dead address for the life of the session.
+	old.driverGen++
+	old.driving = false
+	oldKey := old.key
+	old.mu.Unlock()
+
+	delete(p.sessions, oldKey)
+	delete(p.missedPings, oldKey)
+	p.sessions[newKey] = s
+	p.indexStaticLocked(s, keyHex)
+	go p.driveHandshake(s, gen, time.Time{})
+}
+
 // handleHandshakeInit processes an inbound Noise msg1 (we are the responder).
 func (p *PeerConn) handleHandshakeInit(ep wgconn.Endpoint, msg1 []byte) {
 	sessKey, ap, okKey := canonEndpointKey(ep)
@@ -978,6 +1114,13 @@ func (p *PeerConn) handleHandshakeInit(ep wgconn.Endpoint, msg1 []byte) {
 	resp := s.respMsg
 	sendEp := s.ep
 	s.mu.Unlock()
+
+	// A session created provisionally by this msg1 has no index entry yet: the
+	// static was only learned (and validated) just above. Filing it now is what
+	// lets a later punch from this peer find it if its address moves again.
+	p.mu.Lock()
+	p.indexStaticLocked(s, staticKeyHex(remote))
+	p.mu.Unlock()
 
 	p.bind.Send([][]byte{resp}, sendEp)
 	p.fireConnected(s)
@@ -1165,9 +1308,27 @@ func (p *PeerConn) fireConnected(s *peerSession) {
 func (p *PeerConn) dropSession(addr *net.UDPAddr) {
 	key := canonAddrPort(addr.AddrPort()).String()
 	p.mu.Lock()
+	// Drop the static index too, but only while it still points at this session:
+	// a rebind may have handed the entry to a newer session for the same peer.
+	if s := p.sessions[key]; s != nil && s.staticHex != "" && p.byStatic[s.staticHex] == s {
+		delete(p.byStatic, s.staticHex)
+	}
 	delete(p.sessions, key)
 	delete(p.missedPings, key)
 	p.mu.Unlock()
+}
+
+// indexStaticLocked points byStatic at s for keyHex, releasing any entry s held
+// under a previous key. Caller holds p.mu.
+func (p *PeerConn) indexStaticLocked(s *peerSession, keyHex string) {
+	if s.staticHex == keyHex {
+		return
+	}
+	if s.staticHex != "" && p.byStatic[s.staticHex] == s {
+		delete(p.byStatic, s.staticHex)
+	}
+	s.staticHex = keyHex
+	p.byStatic[keyHex] = s
 }
 
 // fireDead delivers a Dead event reliably (mirror of fireConnected): dropping it

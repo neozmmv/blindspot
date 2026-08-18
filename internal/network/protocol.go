@@ -11,8 +11,16 @@ package network
 //
 //	PacketHandshakeInit  Noise IKpsk2 message 1 (initiator → responder)
 //	PacketHandshakeResp  Noise IKpsk2 message 2 (responder → initiator)
-//	PacketPunch          empty; opens the NAT mapping while a responder waits for msg1
+//	PacketPunch          sender's 32-byte static public key (see below)
 //	PacketData/PacketTun/PacketControl  transport packets (see below)
+//
+// A punch opens the NAT mapping while a responder waits for msg1, and its body
+// names who sent it so the receiver can learn where that peer actually is. The
+// key is cleartext and unauthenticated, so it is only ever used to *move* an
+// unestablished session to the address the punch was received from; it can
+// never establish one, which still requires the full Noise handshake against
+// the pinned static key and the PSK. A body of any other length (an older
+// peer's empty punch) is ignored, so the change is compatible both ways.
 //
 // A transport packet body is:
 //
@@ -43,7 +51,7 @@ const ProtocolVersion byte = 0x02
 const (
 	PacketHandshakeInit byte = 0x10 // Noise IKpsk2 msg1 (initiator → responder)
 	PacketHandshakeResp byte = 0x11 // Noise IKpsk2 msg2 (responder → initiator)
-	PacketPunch         byte = 0x12 // empty NAT hole-punch keepalive during handshake
+	PacketPunch         byte = 0x12 // NAT hole-punch during handshake; body is the sender's static key
 
 	PacketData    byte = 0x04 // encrypted application data (chat)
 	PacketTun     byte = 0x07 // encrypted tunnelled IP packet (VPN)

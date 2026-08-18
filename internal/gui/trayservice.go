@@ -366,7 +366,7 @@ func (s *TrayService) Disconnect() (string, error) {
 	if !s.sessionRunning() {
 		return "No active session.", nil
 	}
-	if err := os.WriteFile(sessionStopFile(), []byte("stop"), 0600); err != nil {
+	if err := utils.WriteStateFile(sessionStopFile(), []byte("stop"), 0600); err != nil {
 		return "", fmt.Errorf("could not signal daemon: %w", err)
 	}
 	deadline := time.Now().Add(10 * time.Second)

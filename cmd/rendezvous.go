@@ -53,7 +53,7 @@ func writePeers(m *sync.Map) {
 		return true
 	})
 	data, _ := json.Marshal(entries)
-	os.WriteFile(peersFile(), data, 0600)
+	utils.WriteStateFile(peersFile(), data, 0600)
 }
 
 var RendezvousCmd = &cobra.Command{

@@ -221,6 +221,7 @@ func runSessionDaemon(p daemonParams) {
 	}
 	go roster.keepRegistered(quit, nil)
 	go roster.followStream(quit, nil)
+	go roster.keepMappingAlive(quit, nil)
 
 	// virtualIPMap maps each peer's virtual IP to their UDP address for TUN routing.
 	var virtualIPMap sync.Map

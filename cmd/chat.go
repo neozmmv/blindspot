@@ -186,6 +186,7 @@ func runChatSession(ref *discoveryRef, roomName, password string, live *atomic.B
 	announce := func(addrStr string) { fmt.Printf("\nNew peer discovered: %s\n> ", addrStr) }
 	go roster.keepRegistered(quit, announce)
 	go roster.followStream(quit, announce)
+	go roster.keepMappingAlive(quit, announce)
 
 	// single read loop
 	go func() {

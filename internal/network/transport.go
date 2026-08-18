@@ -178,18 +178,48 @@ func (b *udpBind) ParseEndpoint(s string) (wgconn.Endpoint, error) {
 	return udpEndpoint(canonAddrPort(ap)), nil
 }
 
-func (b *udpBind) Close() error             { return b.conn.Close() }
-func (b *udpBind) SetMark(_ uint32) error   { return nil }
-func (b *udpBind) BatchSize() int           { return wgconn.IdealBatchSize }
+func (b *udpBind) Close() error           { return b.conn.Close() }
+func (b *udpBind) SetMark(_ uint32) error { return nil }
+func (b *udpBind) BatchSize() int         { return wgconn.IdealBatchSize }
 
 // stunServer is the public STUN server used to discover this host's public
 // address for NAT traversal.
 const stunServer = "stun.l.google.com:19302"
 
+// stunProbeServers are the servers ProbeNATMapping queries. Detecting
+// endpoint-dependent ("symmetric") mapping requires two servers at *different*
+// IP addresses: the whole test is whether the NAT hands out the same external
+// port for two different destinations. They are deliberately run by different
+// operators, so one being down or anycast-collapsed does not silently turn the
+// test into a comparison of one server with itself.
+var stunProbeServers = []string{
+	"stun.l.google.com:19302",
+	"stun.cloudflare.com:3478",
+	"stun.nextcloud.com:443",
+}
+
+// parseSTUNMapped extracts the XOR-MAPPED-ADDRESS from a datagram, reporting
+// false for anything that is not a decodable STUN binding response.
+func parseSTUNMapped(pkt []byte) (string, bool) {
+	m := &stun.Message{Raw: pkt}
+	if err := m.Decode(); err != nil {
+		return "", false
+	}
+	var xorAddr stun.XORMappedAddress
+	if err := xorAddr.GetFrom(m); err != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%s:%d", xorAddr.IP, xorAddr.Port), true
+}
+
 // DiscoverPublicAddr sends a STUN binding request through the tunnel's own
 // bind (so the discovered mapping is the one peers will punch to) and returns
 // the public "ip:port". Unlike the old one-shot version it retransmits, since
 // a single lost STUN datagram used to hang connection setup forever.
+//
+// Sending the request is also what creates (or refreshes) the NAT mapping peers
+// punch to, which is why RefreshPublicAddr calls this on a timer while no peer
+// is established — see the comment there.
 func (p *PeerConn) DiscoverPublicAddr() (string, error) {
 	raddr, err := net.ResolveUDPAddr("udp4", stunServer)
 	if err != nil {
@@ -214,16 +244,12 @@ func (p *PeerConn) DiscoverPublicAddr() (string, error) {
 		for {
 			select {
 			case pkt := <-ch:
-				m := &stun.Message{Raw: pkt}
-				if err := m.Decode(); err != nil {
+				addr, ok := parseSTUNMapped(pkt)
+				if !ok {
 					continue // unrelated non-protocol packet
 				}
-				var xorAddr stun.XORMappedAddress
-				if err := xorAddr.GetFrom(m); err != nil {
-					continue
-				}
 				timer.Stop()
-				return fmt.Sprintf("%s:%d", xorAddr.IP, xorAddr.Port), nil
+				return addr, nil
 			case <-timer.C:
 				break wait
 			case <-p.stop:
@@ -233,4 +259,105 @@ func (p *PeerConn) DiscoverPublicAddr() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no response from STUN server %s", stunServer)
+}
+
+// NATMapping is what ProbeNATMapping learned about the local NAT.
+type NATMapping struct {
+	// Servers and Addrs are the two STUN servers that answered and the public
+	// address each one saw, in the same order.
+	Servers [2]string
+	Addrs   [2]string
+	// EndpointIndependent is true when both servers saw the same public
+	// address. That is the property hole punching needs: the address one peer
+	// discovers via STUN is the address every other peer can send to.
+	EndpointIndependent bool
+}
+
+// ProbeNATMapping reports whether this host's NAT assigns one external port per
+// socket (endpoint-independent) or a different one per destination
+// ("symmetric"). It queries two STUN servers from a single socket and compares
+// what they saw.
+//
+// It uses its own UDP socket rather than the tunnel's bind: mapping behaviour is
+// a property of the NAT, not of one particular socket, and keeping it standalone
+// lets `blindspot ip --nat` answer the question without starting a session.
+//
+// Endpoint-dependent mapping means the address published to the room is only
+// ever valid for the STUN server that reported it, so peers punch at a port
+// nothing is listening on. That is the one failure this diagnostic exists to
+// name, because it is otherwise indistinguishable from an ordinary timeout.
+func ProbeNATMapping() (NATMapping, error) {
+	var out NATMapping
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		return out, fmt.Errorf("opening probe socket: %w", err)
+	}
+	defer conn.Close()
+
+	var (
+		servers []string
+		addrs   []string
+		lastErr error
+	)
+	for _, srv := range stunProbeServers {
+		addr, err := stunProbe(conn, srv)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// A second server that resolved to the same IP as the first proves
+		// nothing: the comparison has to be across two distinct destinations.
+		servers = append(servers, srv)
+		addrs = append(addrs, addr)
+		if len(servers) == 2 {
+			break
+		}
+	}
+	if len(servers) < 2 {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("not enough STUN servers answered")
+		}
+		return out, fmt.Errorf("need two STUN servers to compare, got %d: %w", len(servers), lastErr)
+	}
+
+	out.Servers = [2]string{servers[0], servers[1]}
+	out.Addrs = [2]string{addrs[0], addrs[1]}
+	out.EndpointIndependent = addrs[0] == addrs[1]
+	return out, nil
+}
+
+// stunProbe sends a binding request to one server on conn and returns the public
+// address it reported. Retransmits, like DiscoverPublicAddr, because a single
+// lost datagram must not be read as "this server is down".
+func stunProbe(conn *net.UDPConn, server string) (string, error) {
+	raddr, err := net.ResolveUDPAddr("udp4", server)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s: %w", server, err)
+	}
+	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+	buf := make([]byte, 1500)
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := conn.WriteToUDP(req.Raw, raddr); err != nil {
+			return "", fmt.Errorf("sending to %s: %w", server, err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		conn.SetReadDeadline(deadline)
+		for time.Now().Before(deadline) {
+			n, from, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				break // timed out; retransmit
+			}
+			// Only the server we are currently asking can answer this question:
+			// a late reply from the previous server carries the previous
+			// server's view and would compare the socket with itself.
+			if !from.IP.Equal(raddr.IP) || from.Port != raddr.Port {
+				continue
+			}
+			if addr, ok := parseSTUNMapped(buf[:n]); ok {
+				return addr, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no response from %s", server)
 }

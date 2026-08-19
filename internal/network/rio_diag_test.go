@@ -72,7 +72,7 @@ func BenchmarkRIOTunnelDelivered(b *testing.B) {
 		}
 		senders := make([]string, sb.pc.BatchSize())
 		for {
-			n, err := sb.pc.ReadTunBatch(bufs, senders)
+			n, err := sb.pc.ReadTunBatch(bufs, senders, 0)
 			if err != nil {
 				return
 			}
@@ -130,7 +130,7 @@ func BenchmarkRIOTunnelBlast(b *testing.B) {
 		}
 		senders := make([]string, sb.pc.BatchSize())
 		for {
-			n, err := sb.pc.ReadTunBatch(bufs, senders)
+			n, err := sb.pc.ReadTunBatch(bufs, senders, 0)
 			if err != nil {
 				close(done)
 				return

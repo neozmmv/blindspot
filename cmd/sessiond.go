@@ -285,7 +285,7 @@ func runSessionDaemon(p daemonParams) {
 
 	// TUN-side counters for the stats log: what enters from the OS, what is
 	// written back to the OS, and what the reverse-path filter rejects.
-	var tunInPkts, tunInBytes, tunOutPkts, tunOutBytes, rpfDrops, noPeerDrops atomic.Uint64
+	var tunInPkts, tunInBytes, tunOutPkts, tunOutBytes, rpfDrops, noPeerDrops, tunWriteErrs atomic.Uint64
 
 	// Stats logger: once per second, append a delta line to stats.log while
 	// there is tunnel activity. Comparing this file across the two machines
@@ -301,7 +301,7 @@ func runSessionDaemon(p daemonParams) {
 		defer f.Close()
 		type snap struct {
 			txP, txB, txE, rxP, rxB, dec, rep, rek, tmo uint64
-			tiP, tiB, toP, toB, rpf, nop                uint64
+			tiP, tiB, toP, toB, rpf, nop, tunErr        uint64
 		}
 		take := func() snap {
 			s := &network.Stats
@@ -312,7 +312,7 @@ func runSessionDaemon(p daemonParams) {
 				s.Rekeys.Load(), s.Timeouts.Load(),
 				tunInPkts.Load(), tunInBytes.Load(),
 				tunOutPkts.Load(), tunOutBytes.Load(),
-				rpfDrops.Load(), noPeerDrops.Load(),
+				rpfDrops.Load(), noPeerDrops.Load(), tunWriteErrs.Load(),
 			}
 		}
 		prev := take()
@@ -328,11 +328,11 @@ func runSessionDaemon(p daemonParams) {
 					continue
 				}
 				fmt.Fprintf(f,
-					"%s tun_in=%d/%dB tx=%d/%dB txerr=%d | rx=%d/%dB tun_out=%d/%dB dec_fail=%d replay=%d rpf=%d nopeer=%d | rekey=%d timeout=%d pace=%dbps\n",
+					"%s tun_in=%d/%dB tx=%d/%dB txerr=%d | rx=%d/%dB tun_out=%d/%dB dec_fail=%d replay=%d rpf=%d nopeer=%d tunerr=%d | rekey=%d timeout=%d pace=%dbps\n",
 					time.Now().Format("15:04:05"),
 					cur.tiP-prev.tiP, cur.tiB-prev.tiB, cur.txP-prev.txP, cur.txB-prev.txB, cur.txE-prev.txE,
 					cur.rxP-prev.rxP, cur.rxB-prev.rxB, cur.toP-prev.toP, cur.toB-prev.toB,
-					cur.dec-prev.dec, cur.rep-prev.rep, cur.rpf-prev.rpf, cur.nop-prev.nop,
+					cur.dec-prev.dec, cur.rep-prev.rep, cur.rpf-prev.rpf, cur.nop-prev.nop, cur.tunErr-prev.tunErr,
 					cur.rek-prev.rek, cur.tmo-prev.tmo, network.Stats.PaceBps.Load()*8)
 				prev = cur
 			}
@@ -340,15 +340,17 @@ func runSessionDaemon(p daemonParams) {
 	}()
 
 	// tunBufPool recycles packet buffers across both pump directions so the
-	// steady state allocates nothing per packet.
+	// steady state allocates nothing per packet. Each buffer carries
+	// tun.WriteOffset bytes of headroom on top of the packet itself, so a
+	// decrypted packet can go to the TUN device without being copied.
 	tunBufPool := sync.Pool{New: func() any {
-		b := make([]byte, 1600)
+		b := make([]byte, bstun.WriteOffset+1600)
 		return &b
 	}}
 	getTunBuf := func() []byte { return *tunBufPool.Get().(*[]byte) }
 	putTunBuf := func(b []byte) {
-		if cap(b) >= 1600 {
-			b = b[:1600]
+		if cap(b) >= bstun.WriteOffset+1600 {
+			b = b[:bstun.WriteOffset+1600]
 			tunBufPool.Put(&b)
 		}
 	}
@@ -365,29 +367,38 @@ func runSessionDaemon(p daemonParams) {
 		senders := make([]string, batch)
 		wr := make([][]byte, 0, batch)
 		for {
-			n, err := peerConn.ReadTunBatch(bufs, senders)
+			n, err := peerConn.ReadTunBatch(bufs, senders, bstun.WriteOffset)
 			if err != nil {
 				return // transport closed
 			}
 			wr = wr[:0]
 			for i := 0; i < n; i++ {
+				// Each buffer is [headroom][packet]; the packet alone is what the
+				// filter and the counters are about.
+				packet := bufs[i][bstun.WriteOffset:]
 				// Reverse-path filter: the inner IPv4 source address must equal the
 				// sender's virtual IP. Otherwise a malicious member could inject packets
 				// spoofing another peer's virtual IP inside the (authenticated) tunnel.
 				expectedVIP, ok := addrToVIP.Load(senders[i])
-				if !ok || !bstun.SrcIPMatchesVirtualIP(bufs[i], expectedVIP.(string)) {
+				if !ok || !bstun.SrcIPMatchesVirtualIP(packet, expectedVIP.(string)) {
 					rpfDrops.Add(1)
 					continue
 				}
 				wr = append(wr, bufs[i])
 				tunOutPkts.Add(1)
-				tunOutBytes.Add(uint64(len(bufs[i])))
+				tunOutBytes.Add(uint64(len(packet)))
 			}
 			if len(wr) == 0 {
 				continue
 			}
 			network.UpdateLastSeen()
-			tunDevice.Write(wr, 0)
+			if _, err := tunDevice.Write(wr, bstun.WriteOffset); err != nil {
+				// Counted, not logged per packet: a device that rejects writes
+				// rejects every one of them, and this is the last step before the
+				// local network stack — silence here is a tunnel that looks
+				// connected while nothing ever arrives.
+				tunWriteErrs.Add(1)
+			}
 		}
 	}()
 

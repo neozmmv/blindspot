@@ -10,13 +10,15 @@ import (
 )
 
 // benchSide is one loopback peer: a real PeerConn over a WrapUDPConn transport.
+// It takes a testing.TB so tests can use the same handshaked pair as the
+// benchmarks.
 type benchSide struct {
 	pc   *PeerConn
 	addr *net.UDPAddr
 	kp   *crypto.KeyPair
 }
 
-func newBenchSide(b *testing.B, psk []byte) *benchSide {
+func newBenchSide(b testing.TB, psk []byte) *benchSide {
 	b.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -35,7 +37,7 @@ func newBenchSide(b *testing.B, psk []byte) *benchSide {
 }
 
 // benchPair returns two handshaked peers on loopback.
-func benchPair(b *testing.B) (*benchSide, *benchSide) {
+func benchPair(b testing.TB) (*benchSide, *benchSide) {
 	b.Helper()
 	psk := crypto.DerivePSK("bench-pass-123", "bench-session")
 	sa := newBenchSide(b, psk)
@@ -75,7 +77,7 @@ func BenchmarkTunnelSend(b *testing.B) {
 		}
 		senders := make([]string, sb.pc.BatchSize())
 		for {
-			if _, err := sb.pc.ReadTunBatch(bufs, senders); err != nil {
+			if _, err := sb.pc.ReadTunBatch(bufs, senders, 0); err != nil {
 				return
 			}
 		}
@@ -120,7 +122,7 @@ func BenchmarkTunnelRoundtrip(b *testing.B) {
 		}
 		senders := make([]string, sb.pc.BatchSize())
 		for {
-			n, err := sb.pc.ReadTunBatch(bufs, senders)
+			n, err := sb.pc.ReadTunBatch(bufs, senders, 0)
 			if err != nil {
 				return
 			}

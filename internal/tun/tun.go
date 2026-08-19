@@ -11,6 +11,23 @@ import (
 // Device re-exports the wireguard TUN interface so callers don't need to import wireguard directly.
 type Device = wgtun.Device
 
+// WriteOffset is the headroom every packet handed to Device.Write must carry in
+// front of it: the packet has to sit at buf[WriteOffset:], not at buf[0:].
+//
+// Linux is why. The kernel gives a modern TUN device a virtio net header
+// (IFF_VNET_HDR), so wireguard-go writes a 10-byte header into the bytes
+// immediately before the packet — and rejects the whole batch with "invalid
+// offset" when there is no room for it. Nothing else reports the problem: the
+// read direction has no such requirement, so a tunnel with no headroom looks
+// half-alive, sending fine while every packet arriving from a peer is dropped
+// at the last step before the local network stack.
+//
+// The value matches wireguard-go's own MessageTransportOffsetContent rather
+// than the 10 bytes strictly needed, so the same figure is correct on every
+// platform (Windows and Darwin honour any offset) and stays correct if the
+// header ever grows.
+const WriteOffset = 16
+
 // VirtualIPv4 derives a stable virtual IPv4 address from a peer's public key.
 func VirtualIPv4(publicKey []byte) string {
 	hash := sha256.Sum256(publicKey)

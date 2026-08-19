@@ -825,7 +825,13 @@ func (p *PeerConn) Read() (byte, []byte, *net.UDPAddr, error) {
 // needed); senders[:n] receives each packet's canonical remote address string,
 // suitable for keying reverse-path maps. Non-tun packets and packets that fail
 // authentication or replay checks are dropped. Not safe for concurrent use.
-func (p *PeerConn) ReadTunBatch(bufs [][]byte, senders []string) (int, error) {
+//
+// headroom bytes of each buffer are left untouched in front of the plaintext,
+// so bufs[i] is [headroom bytes][packet] and the packet itself is
+// bufs[i][headroom:]. TUN devices need that space to prepend their own header
+// (see tun.WriteOffset); decrypting straight into buf[0] would leave the caller
+// with a packet it cannot hand to the device without copying it again.
+func (p *PeerConn) ReadTunBatch(bufs [][]byte, senders []string, headroom int) (int, error) {
 	if len(bufs) == 0 {
 		return 0, nil
 	}
@@ -861,7 +867,10 @@ drain:
 		if pkts[i].typ != PacketTun {
 			return
 		}
-		plaintext, err := pkts[i].s.decrypt(bufs[i][:0], pkts[i].buf)
+		// Open appends, so decrypting into bufs[i][:headroom] returns the
+		// headroom and the plaintext as one slice, with the packet at
+		// [headroom:] — which is exactly what Device.Write wants.
+		plaintext, err := pkts[i].s.decrypt(bufs[i][:headroom], pkts[i].buf)
 		if err != nil {
 			return
 		}

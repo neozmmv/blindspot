@@ -2,6 +2,11 @@
 
 # Blindspot
 
+## ❗ Important!
+
+Blindspot uses a custom network protocol and isn't being actively mainteined.
+Avoid using it, use [Quix](https://github.com/quixvpn/quix) instead. For voice and video, use [noxid](https://github.com/neozmmv/noxid).
+
 A P2P VPN and networking toolkit built on UDP hole punching with end-to-end encryption. Connect directly to peers without servers in the middle — traverses NAT and CGNAT automatically.
 
 Peers find each other in one of two ways:
